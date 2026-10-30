@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+
+# q55 : Alveo U55C board access queue manager , runs on the machine hosting the board
+#
+#   q55 server                                          run the queue manager (enics account , forever)
+#   q55 prog   <bitstream> [-t <minutes>]               queue a bitstream load request
+#   q55 access <bitstream> [-t <minutes>] [-- <cmd>]    exclusive board access , loads the bitstream if needed
+#   q55 status                                          queue status
+#   q55 shutdown                                        graceful queue manager shutdown
+#
+# See README.md
+
+import os
+import sys
+import pwd
+import json
+import time
+import shlex
+import socket
+import struct
+import signal
+import shutil
+import argparse
+import threading
+import subprocess
+from collections import deque
+from datetime import datetime
+
+#----------------------------------------------------------------------------------------
+
+Q55_DIR    = os.environ.get('Q55_DIR','/tmp/q55')             # socket and bitstream spool
+SOCK_PATH  = Q55_DIR + '/q55.sock'
+SPOOL_DIR  = Q55_DIR + '/spool'
+MGR_USER   = os.environ.get('Q55_MGR_USER','enics')           # clients only trust a manager run by this user
+HERE       = os.path.dirname(os.path.abspath(__file__))
+PROG_CMD   = os.environ.get('Q55_PROG_CMD', HERE + '/program.sh')   # called with the bitstream path
+NEED_SUDO  = 'Q55_PROG_CMD' not in os.environ                 # program.sh needs the manager's sudo
+STATE_FILE = os.path.expanduser(os.environ.get('Q55_STATE','~/.q55_state.json'))
+LOG_FILE   = os.path.expanduser(os.environ.get('Q55_LOG','~/.q55.log'))
+GRACE_SEC  = float(os.environ.get('Q55_GRACE_SEC','60'))      # warning before an access session is revoked
+DEF_MIN    = 10                                               # default allocation minutes
+LOAD_TIMEOUT_SEC = 900
+SUDO_KEEPALIVE_SEC = 240
+UART_DEV   = '/dev/ttyUSB2'                                   # FT4232H channel C
+
+#----------------------------------------------------------------------------------------
+
+def log(msg) :
+    line = datetime.now().strftime('%Y-%m-%d %H:%M:%S  ') + msg
+    print(line, flush=True)
+    try :
+       with open(LOG_FILE,'a') as f : f.write(line + '\n')
+    except OSError :
+       pass
+
+def hhmm(t) :
+    return datetime.fromtimestamp(t).strftime('%H:%M')
+
+def dur(sec) :
+    sec = max(0,int(sec))
+    return '%d:%02d' % (sec//60, sec%60)
+
+def send(conn, mtype, msg='', **kw) :
+    # One JSON message per line ; a vanished client is ignored (its handler cleans up)
+    try :
+       conn.sendall((json.dumps(dict(type=mtype, msg=msg, **kw)) + '\n').encode())
+    except OSError :
+       pass
+
+def close_conn(conn) :
+    try :
+       conn.shutdown(socket.SHUT_RDWR)
+    except OSError :
+       pass
+
+class Refused(Exception) :
+    pass
+
+#========================================================================================
+# Queue manager
+#========================================================================================
+
+class Mgr :
+
+   def __init__(self) :
+      self.cv      = threading.Condition()
+      self.active  = None    # loaded bitstream {path ver snap user t loaded_at}
+      self.loading = None    # load entry being programmed
+      self.loads   = []      # pending loads {path ver snap user t req_at}
+      self.holder  = None    # access entry holding the board
+      self.waiters = []      # pending access {id user path t conn req_at granted_at warned_at}
+      self.events  = deque(maxlen=8)
+      self.stopping = False
+      self.done     = False
+      self.seq      = 0
+      self.started  = time.time()
+      self.restore_state()
+
+   #-------------------------------------------------------------------------------------
+
+   def event(self, msg) :
+      log(msg)
+      self.events.append(hhmm(time.time()) + '  ' + msg)
+
+   def window_left(self) :
+      return self.active['loaded_at'] + self.active['t']*60 - time.time() if self.active else 0
+
+   def load_due(self) :
+      # A pending load replaces the active bitstream once its allocation window is over
+      return bool(self.loads) and (self.active is None or self.window_left() <= 0)
+
+   def same_file(self, e, path, ver) :
+      return e is not None and e['path'] == path and e['ver'] == ver
+
+   #-------------------------------------------------------------------------------------
+
+   def save_state(self) :
+      try :
+         with open(STATE_FILE,'w') as f : json.dump(self.active,f)
+      except OSError as x :
+         log('WARNING: cannot save state: %s' % x)
+
+   def restore_state(self) :
+      try :
+         with open(STATE_FILE) as f : a = json.load(f)
+      except (OSError,ValueError) :
+         return
+      if a :
+         a['ver'] = tuple(a['ver'])
+         a['restored'] = True
+         if not os.path.exists(a.get('snap') or '') : a['snap'] = None
+         self.active = a
+         log('Restored from the previous run: %s (loaded by %s at %s) , not verified on the board'
+             % (a['path'],a['user'],hhmm(a['loaded_at'])))
+
+   def cleanup_spool(self) :
+      used = set(e['snap'] for e in [self.active,self.loading] + self.loads if e and e['snap'])
+      for f in os.listdir(SPOOL_DIR) :
+         p = SPOOL_DIR + '/' + f
+         if not f.endswith('.part') and p not in used :
+            os.remove(p)
+
+   #-------------------------------------------------------------------------------------
+   # Load requests (q55 prog , and q55 access when the bitstream is not active or queued)
+
+   def decide(self, user, path, ver, t, snap) :
+      # Returns (message , need_snapshot). Called with the lock held.
+      if self.stopping :
+         raise Refused('the queue manager is shutting down')
+      a = self.active
+      if self.same_file(a,path,ver) :
+         w = self.window_left()
+         return ('ACTIVE: %s is loaded (by %s at %s , %s)' % (path,a['user'],hhmm(a['loaded_at']),
+                 'allocation window %s left' % dur(w) if w > 0 else 'allocation window over'), False)
+      if self.loading and self.loading['path'] == path and self.loading['ver'] == ver :
+         return ('LOADING: %s is being loaded now' % path, False)
+      for i,e in enumerate(self.loads) :
+         if e['path'] == path :
+            if e['ver'] == ver :
+               return ('PENDING: %s is already in the load queue at position %d' % (path,i+1), False)
+            if snap is None : return (None, True)
+            e['ver'], e['snap'] = ver, snap
+            return ('PENDING: %s is in the load queue at position %d , updated to the newer file' % (path,i+1), False)
+      if snap is None : return (None, True)
+      changed = ' (changed since it was loaded)' if a and a['path'] == path else ''
+      self.loads.append(dict(path=path, ver=ver, snap=snap, user=user, t=t, req_at=time.time()))
+      self.event('%s queued a load of %s%s' % (user,path,changed))
+      self.cv.notify_all()
+      pos = len(self.loads)
+      if self.loading is None and self.holder is None and pos == 1 and self.load_due() :
+         return ('QUEUED: %s%s , loading starts now' % (path,changed), False)
+      return ('BUSY: the board is allocated , your load of %s%s is queued at position %d\n\n%s'
+              % (path,changed,pos,self.status_text()), False)
+
+   def request_load(self, user, path, fd, t) :
+      st = os.fstat(fd)
+      ver = (st.st_size, st.st_mtime_ns)
+      with self.cv :
+         msg, need = self.decide(user,path,ver,t,None)
+         if not need :
+            return msg
+         self.seq += 1
+         snap = '%s/%d_%s' % (SPOOL_DIR,self.seq,os.path.basename(path))
+      # Copy the bitstream into the spool (the manager can't read user files by path)
+      with os.fdopen(os.dup(fd),'rb') as src, open(snap + '.part','wb') as dst :
+         src.seek(0)
+         shutil.copyfileobj(src,dst,1<<20)
+      os.rename(snap + '.part',snap)
+      with self.cv :
+         msg, need = self.decide(user,path,ver,t,snap)
+         self.cleanup_spool()  # drops the copy if someone else queued the same file meanwhile
+      return msg
+
+   #-------------------------------------------------------------------------------------
+
+   def run_load(self, e) :
+      log('Loading %s (requested by %s) ...' % (e['path'],e['user']))
+      ok, out = False, ''
+      try :
+         if NEED_SUDO and subprocess.call(['sudo','-n','true'],stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) != 0 :
+            out = 'the queue manager sudo credential expired , the manager must be restarted'
+         else :
+            p = subprocess.run(shlex.split(PROG_CMD) + [e['snap']],stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=LOAD_TIMEOUT_SEC)
+            out, ok = p.stdout, p.returncode == 0
+      except Exception as x :
+         out = str(x)
+      with self.cv :
+         self.loading = None
+         if ok :
+            self.active = dict(e, loaded_at=time.time())
+            self.save_state()
+            self.event('Loaded %s (requested by %s , allocation %g min)' % (e['path'],e['user'],e['t']))
+            for w in self.waiters :
+               if w['path'] == e['path'] :
+                  send(w['conn'],'info','%s is loaded , waiting for board access' % e['path'])
+         else :
+            log('Load output:\n' + out.rstrip())
+            tail = '\n'.join(out.strip().splitlines()[-5:])
+            self.event('LOAD FAILED: %s (requested by %s)' % (e['path'],e['user']))
+            # The board state is unknown after a failed load
+            self.active = None
+            self.save_state()
+            for w in [w for w in self.waiters if w['path'] == e['path']] :
+               send(w['conn'],'error','load of %s failed:\n%s' % (e['path'],tail))
+               close_conn(w['conn'])
+               self.waiters.remove(w)
+         self.cleanup_spool()
+         self.cv.notify_all()
+
+   #-------------------------------------------------------------------------------------
+   # Scheduler , called every second and on every queue change , with the lock held
+
+   def tick(self) :
+      now = time.time()
+      h = self.holder
+      if h :
+         a = self.active
+         contention = self.load_due() or any(a and w['path'] == a['path'] for w in self.waiters)
+         due = self.stopping or (contention and now >= h['granted_at'] + h['t']*60)
+         if not due :
+            if h['warned_at'] is not None :
+               h['warned_at'] = None
+               send(h['conn'],'info','nobody is waiting any more , your access continues')
+         elif h['warned_at'] is None :
+            h['warned_at'] = now
+            why = 'the queue manager is shutting down' if self.stopping else 'other users are waiting'
+            send(h['conn'],'warn','%s , your board access ends in %d seconds' % (why,GRACE_SEC))
+            log('Warned %s (%s)' % (h['user'],why))
+         elif now >= h['warned_at'] + GRACE_SEC :
+            send(h['conn'],'revoked','your board access time is over')
+            self.event('Access of %s revoked after %s' % (h['user'],dur(now - h['granted_at'])))
+            close_conn(h['conn'])
+            self.holder = None
+
+      if self.stopping :
+         for w in self.waiters :
+            send(w['conn'],'error','the queue manager is shutting down')
+            close_conn(w['conn'])
+         self.waiters = []
+         if self.holder is None and self.loading is None :
+            self.done = True
+         return
+
+      if self.holder or self.loading :
+         return
+
+      if self.load_due() :
+         # Users waiting for the outgoing bitstream are queued behind the pending loads
+         a = self.active
+         if a and any(w['path'] == a['path'] for w in self.waiters) and not any(e['path'] == a['path'] for e in self.loads) :
+            if a['snap'] :
+               self.loads.append(dict(a, req_at=now))
+            else :
+               for w in [w for w in self.waiters if w['path'] == a['path']] :
+                  send(w['conn'],'error','%s is no longer available to reload , run q55 access again' % a['path'])
+                  close_conn(w['conn'])
+                  self.waiters.remove(w)
+         self.loading = self.loads.pop(0)
+         threading.Thread(target=self.run_load,args=(self.loading,),daemon=True).start()
+         return
+
+      for w in self.waiters :
+         if self.active and w['path'] == self.active['path'] :
+            self.waiters.remove(w)
+            w['granted_at'], w['warned_at'] = now, None
+            self.holder = w
+            self.event('Access granted to %s (%s , minimum %g min)' % (w['user'],w['path'],w['t']))
+            send(w['conn'],'granted','board access granted for at least %g min , %s is loaded' % (w['t'],w['path']))
+            break
+
+   def scheduler(self) :
+      with self.cv :
+         while not self.done :
+            self.tick()
+            self.cv.wait(1.0)
+
+   #-------------------------------------------------------------------------------------
+
+   def status_text(self) :
+      now = time.time()
+      L = ['U55C queue manager on %s , run by %s since %s' % (socket.gethostname(),pwd.getpwuid(os.getuid()).pw_name,
+           datetime.fromtimestamp(self.started).strftime('%Y-%m-%d %H:%M'))]
+      if self.stopping :
+         L.append('SHUTTING DOWN')
+      a = self.active
+      if a :
+         w = self.window_left()
+         L.append('Active bitstream : %s' % a['path'])
+         L.append('                   loaded by %s at %s , %s%s' % (a['user'],hhmm(a['loaded_at']),
+                  'allocation window %s left' % dur(w) if w > 0 else 'allocation window over , stays loaded until another load is requested',
+                  ' (restored from the previous manager run)' if a.get('restored') else ''))
+      else :
+         L.append('Active bitstream : none (or unknown)')
+      if self.loading :
+         L.append('Loading now      : %s (requested by %s)' % (self.loading['path'],self.loading['user']))
+      h = self.holder
+      if h :
+         s = 'Access holder    : %s , since %s , minimum %g min' % (h['user'],hhmm(h['granted_at']),h['t'])
+         if h['warned_at'] is not None :
+            s += ' , revoked in %s' % dur(h['warned_at'] + GRACE_SEC - now)
+         L.append(s)
+      else :
+         L.append('Access holder    : none')
+      L.append('Access queue     : %s' % ('empty' if not self.waiters else ''))
+      for i,w in enumerate(self.waiters) :
+         L.append('   %d. %-10s %g min  waiting %s  %s' % (i+1,w['user'],w['t'],dur(now - w['req_at']),w['path']))
+      L.append('Load queue       : %s' % ('empty' if not self.loads else ''))
+      for i,e in enumerate(self.loads) :
+         L.append('   %d. %-10s %g min  waiting %s  %s' % (i+1,e['user'],e['t'],dur(now - e['req_at']),e['path']))
+      if self.events :
+         L.append('Recent events    :')
+         L += ['   ' + e for e in self.events]
+      return '\n'.join(L)
+
+   #-------------------------------------------------------------------------------------
+   # Client connections
+
+   def handle(self, conn) :
+      try :
+         pid, uid, gid = struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,struct.calcsize('3i')))
+         try :
+            user = pwd.getpwuid(uid).pw_name
+         except KeyError :
+            user = str(uid)
+         data, fds, _, _ = socket.recv_fds(conn,65536,1)
+         try :
+            req = json.loads(data.decode())
+            cmd = req['cmd']
+            if cmd == 'status' :
+               with self.cv :
+                  send(conn,'end',self.status_text())
+            elif cmd == 'shutdown' :
+               if uid not in (0,os.getuid()) :
+                  raise Refused('only %s can shut down the queue manager' % pwd.getpwuid(os.getuid()).pw_name)
+               with self.cv :
+                  self.stopping = True
+                  self.event('Shutdown requested by %s' % user)
+                  self.cv.notify_all()
+               send(conn,'end','the queue manager is shutting down (after the current load and access session)')
+            elif cmd in ('prog','access') :
+               if len(fds) != 1 :
+                  raise Refused('no bitstream file received')
+               msg = self.request_load(user,req['path'],fds[0],float(req['t']))
+               if cmd == 'prog' :
+                  send(conn,'end',msg)
+               else :
+                  self.access(conn,user,req,msg)
+            else :
+               raise Refused('unknown command %s' % cmd)
+         except Refused as x :
+            send(conn,'error',str(x))
+         finally :
+            for fd in fds : os.close(fd)
+      except Exception as x :
+         log('ERROR: client request failed: %r' % x)
+         send(conn,'error','queue manager internal error: %r' % x)
+      finally :
+         conn.close()
+
+   def access(self, conn, user, req, load_msg) :
+      with self.cv :
+         self.seq += 1
+         w = dict(id=self.seq, user=user, path=req['path'], t=float(req['t']), conn=conn,
+                  req_at=time.time(), granted_at=None, warned_at=None)
+         if self.stopping :
+            raise Refused('the queue manager is shutting down')
+         self.waiters.append(w)
+         log('%s waits for access (%s , %g min)' % (user,w['path'],w['t']))
+         send(conn,'info','%s\nWaiting for board access (%d in the access queue) , Ctrl-C to cancel'
+              % (load_msg,len(self.waiters)))
+         self.cv.notify_all()
+      # The session lasts while the client keeps the connection open
+      while True :
+         try :
+            if not conn.recv(4096) : break
+         except OSError :
+            break
+      with self.cv :
+         if self.holder is w :
+            self.holder = None
+            self.event('Access released by %s after %s' % (user,dur(time.time() - w['granted_at'])))
+         elif w in self.waiters :
+            self.waiters.remove(w)
+            log('%s cancelled the access request' % user)
+         self.cv.notify_all()
+
+#========================================================================================
+# Server
+#========================================================================================
+
+def sudo_keepalive() :
+   while True :
+      time.sleep(SUDO_KEEPALIVE_SEC)
+      if subprocess.call(['sudo','-n','-v'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) != 0 :
+         log('WARNING: sudo credential refresh failed , bitstream loads will fail')
+
+def server() :
+   me = pwd.getpwuid(os.getuid()).pw_name
+   if me != MGR_USER :
+      sys.exit('q55: the queue manager must run as %s (or set Q55_MGR_USER for every user)' % MGR_USER)
+   os.makedirs(Q55_DIR,exist_ok=True)
+   st = os.lstat(Q55_DIR)
+   if st.st_uid != os.getuid() or not os.path.isdir(Q55_DIR) or os.path.islink(Q55_DIR) :
+      sys.exit('q55: %s is not a directory owned by %s' % (Q55_DIR,me))
+   os.chmod(Q55_DIR,0o755)
+   os.makedirs(SPOOL_DIR,exist_ok=True)
+   os.chmod(SPOOL_DIR,0o700)
+   if os.path.exists(SOCK_PATH) :
+      try :
+         s = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+         s.connect(SOCK_PATH)
+         sys.exit('q55: a queue manager is already running')
+      except OSError :
+         os.remove(SOCK_PATH)
+   if NEED_SUDO :
+      print('The queue manager loads bitstreams with sudo , enter the %s password if asked' % me)
+      if subprocess.call(['sudo','-v']) != 0 :
+         sys.exit('q55: sudo failed')
+      threading.Thread(target=sudo_keepalive,daemon=True).start()
+
+   mgr = Mgr()
+   for f in os.listdir(SPOOL_DIR) :          # leftovers of a previous run
+      p = SPOOL_DIR + '/' + f
+      if not (mgr.active and mgr.active['snap'] == p) : os.remove(p)
+
+   srv = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+   srv.bind(SOCK_PATH)
+   os.chmod(SOCK_PATH,0o666)
+   srv.listen(16)
+   srv.settimeout(1.0)
+   threading.Thread(target=mgr.scheduler,daemon=True).start()
+   log('U55C queue manager started (pid %d , socket %s , load command %s)' % (os.getpid(),SOCK_PATH,PROG_CMD))
+
+   while not mgr.done :
+      try :
+         conn, _ = srv.accept()
+         conn.settimeout(None)
+         threading.Thread(target=mgr.handle,args=(conn,),daemon=True).start()
+      except socket.timeout :
+         pass
+      except KeyboardInterrupt :
+         with mgr.cv :
+            if mgr.stopping :
+               log('Second Ctrl-C , exiting now')
+               break
+            mgr.stopping = True
+            mgr.event('Shutdown requested (Ctrl-C) , Ctrl-C again to exit now')
+            mgr.cv.notify_all()
+   srv.close()
+   os.remove(SOCK_PATH)
+   log('U55C queue manager stopped')
+
+#========================================================================================
+# Client
+#========================================================================================
+
+def connect() :
+   try :
+      owner = pwd.getpwuid(os.stat(Q55_DIR).st_uid).pw_name
+      if owner != MGR_USER :
+         sys.exit('q55: %s is owned by %s , not by the queue manager user %s' % (Q55_DIR,owner,MGR_USER))
+      s = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+      s.connect(SOCK_PATH)
+      return s
+   except (OSError,KeyError) :
+      sys.exit('q55: the U55C queue manager is not running (ask the %s account to run: q55 server)' % MGR_USER)
+
+def request(req, bit=None) :
+   s = connect()
+   fds = []
+   if bit is not None :
+      if not os.path.isfile(bit) :
+         sys.exit('q55: bitstream %s not found' % bit)
+      req['path'] = os.path.realpath(bit)
+      fds = [os.open(bit,os.O_RDONLY)]
+   socket.send_fds(s,[(json.dumps(req) + '\n').encode()],fds)
+   for fd in fds : os.close(fd)
+   return s, (json.loads(line) for line in s.makefile('r',encoding='utf-8'))
+
+def simple_cmd(req, bit=None) :
+   s, msgs = request(req,bit)
+   for m in msgs :
+      print(m['msg'])
+      sys.exit(1 if m['type'] == 'error' else 0)
+   sys.exit('q55: no answer from the queue manager')
+
+def access_cmd(bit, t, cmd) :
+   s, msgs = request({'cmd':'access','t':t},bit)
+   try :
+      for m in msgs :
+         print(m['msg'],flush=True)
+         if m['type'] == 'error' : sys.exit(1)
+         if m['type'] == 'granted' : break
+      else :
+         sys.exit('q55: the queue manager closed the connection')
+   except KeyboardInterrupt :
+      sys.exit('\nq55: access request cancelled')
+
+   # Run the session in its own process group , in the terminal foreground , so that it can be revoked as a whole
+   tty = sys.stdin.isatty()
+   def child_setup() :
+      os.setpgid(0,0)
+      if tty :
+         signal.signal(signal.SIGTTOU,signal.SIG_IGN)
+         os.tcsetpgrp(0,os.getpgrp())
+         signal.signal(signal.SIGTTOU,signal.SIG_DFL)
+   env = dict(os.environ, Q55_ACCESS='1', Q55_BITSTREAM=os.path.realpath(bit), Q55_UART=UART_DEV)
+   if not cmd :
+      cmd = [os.environ.get('SHELL','/bin/bash'),'-i']
+      print('*** q55: U55C access shell , type exit to release the board ***',flush=True)
+   p = subprocess.Popen(cmd,env=env,preexec_fn=child_setup)
+   revoked = [False]
+
+   def watch() :
+      for m in msgs :
+         print('\n*** q55: %s ***' % m['msg'],file=sys.stderr,flush=True)
+         if m['type'] == 'revoked' :
+            revoked[0] = True
+            for sig,wait in ((signal.SIGHUP,5),(signal.SIGKILL,0)) :
+               try :
+                  os.killpg(p.pid,sig)
+               except ProcessLookupError :
+                  return
+               end = time.time() + wait
+               while p.poll() is None and time.time() < end : time.sleep(0.1)
+            return
+
+   threading.Thread(target=watch,daemon=True).start()
+   signal.signal(signal.SIGINT,signal.SIG_IGN)
+   rc = p.wait()
+   if tty :
+      signal.signal(signal.SIGTTOU,signal.SIG_IGN)
+      os.tcsetpgrp(0,os.getpgrp())
+   s.close()
+   print('q55: board access %s' % ('revoked' if revoked[0] else 'released'))
+   sys.exit(2 if revoked[0] else rc)
+
+#========================================================================================
+
+def main() :
+   argv = sys.argv[1:]
+   cmd = []
+   if '--' in argv :
+      i = argv.index('--')
+      argv, cmd = argv[:i], argv[i+1:]
+   ap = argparse.ArgumentParser(prog='q55',description='Alveo U55C board access queue manager')
+   sub = ap.add_subparsers(dest='op',required=True)
+   sub.add_parser('server',help='run the queue manager (%s account)' % MGR_USER)
+   for op,hlp in (('prog','queue a bitstream load request'),
+                  ('access','wait for exclusive board access , loading the bitstream if needed ; '
+                            'runs <cmd> (after --) or a shell')) :
+      p = sub.add_parser(op,help=hlp)
+      p.add_argument('bitstream')
+      p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
+                     help='allocation time once loaded / granted (default %d min)' % DEF_MIN)
+   sub.add_parser('status',help='queue status')
+   sub.add_parser('shutdown',help='graceful queue manager shutdown')
+   args = ap.parse_args(argv)
+
+   if cmd and args.op != 'access' :
+      ap.error('-- <cmd> is only valid with access')
+   if args.op in ('prog','access') and args.t <= 0 :
+      ap.error('-t must be positive')
+
+   if args.op == 'server'     : server()
+   elif args.op == 'prog'     : simple_cmd({'cmd':'prog','t':args.t},args.bitstream)
+   elif args.op == 'access'   : access_cmd(args.bitstream,args.t,cmd)
+   else                       : simple_cmd({'cmd':args.op})
+
+if __name__ == '__main__' :
+   main()
