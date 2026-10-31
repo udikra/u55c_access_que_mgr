@@ -23,6 +23,7 @@ exit                                         # release the board for the next us
 | `q55 access <bit> [-t <min>]` | Waits for exclusive use of the board, then opens a shell. Loads `<bit>` first if needed. |
 | `q55 access <bit> [-t <min>] -- <cmd>` | The same, but runs `<cmd>` and releases the board when it ends. |
 | `q55 prog <bit> [-t <min>]` | Only queues a load of `<bit>` and returns right away. It doesn't give you the board. |
+| `q55 release` | Releases your board access now, even before your `-t` is over, and cancels your waiting access requests. |
 | `q55 -h` | Help. |
 
 `-t` defaults to 10 minutes.
@@ -35,6 +36,8 @@ exit                                         # release the board for the next us
    You hold the board as long as that shell is open. Run anything you like there: Python scripts,
    a terminal program on the UART, your own test setup, and so on.
 4. **Release.** Type `exit`. You are back in your original shell, and the next user gets the board.
+   Or run `q55 release`, from inside the session or from any other terminal. It ends your session at once,
+   even if your `-t` time isn't over, and also cancels any of your access requests that are still waiting.
 
 With `-- <cmd>`, steps 3 and 4 happen by themselves: the board is released when `<cmd>` ends.
 
@@ -77,7 +80,7 @@ Messages you may see when you ask for a bitstream:
 - **Don't load bitstreams yourself** (Vivado Hardware Manager, `program.sh`). The queue manager wouldn't
   know about the load, and the next user would get the wrong image. Using Vivado for debugging without
   loading a bitstream is fine.
-- Release the board (`exit`) as soon as you are done.
+- Release the board (`exit` or `q55 release`) as soon as you are done.
 
 ## Troubleshooting
 
