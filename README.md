@@ -11,7 +11,7 @@ Users run `q55` from their own accounts, which have no sudo rights.
 
 ```
 q55 prog   <bitstream_path> [-t <minutes>]               queue a bitstream load
-q55 access <bitstream_path> [-t <minutes>] [-- <cmd>]    exclusive board access
+q55 access <bitstream_path> [-t <minutes>] [-- <cmd>]    queue an access request (exclusive board access)
 q55 status                                               queue status
 q55 release                                              release your board access now, cancel your waiting requests
 q55 shutdown                                             graceful manager shutdown (enics only)
@@ -36,25 +36,13 @@ Queues a load of the bitstream and returns right away. The command doesn't wait 
 
 ### q55 access
 
-Waits for exclusive use of the board, then runs `<cmd>` or, if you give no command, an
-interactive shell. The board is released when the command or shell exits.
+Queues an access request. When your turn comes, you get exclusive use of the board, and `q55` runs `<cmd>`
+or, if you give no command, an interactive shell. The board is released when the command or shell exits.
 
 - Loading a bitstream can take a minute or two. `q55` prints `Loading <path> now` when the load starts.
 - With no command, you get a new shell (a child of `q55`) in the same directory. Its prompt starts with
   `(q55)` (bash only), much like a Python virtualenv prompt. You hold the board for as long as this shell is open:
   run your tests there, then type `exit` to release the board and return to your original shell.
-
-### q55 release
-
-Releases your board access right away, even if your `-t` time isn't over, and cancels any of your access
-requests that are still waiting. Use it from inside the session or from any other terminal, for example
-when the session runs a long command or was left open somewhere else.
-
-- Your session's shell or command is ended at once (SIGHUP, then SIGKILL), with no 60-second warning,
-  and the board goes to the next user. `q55 access` then exits with code 0.
-- The bitstream stays loaded, and its allocation window doesn't change.
-- `enics` can run `q55 release` to end anyone's session, for example one left open by mistake.
-
 - If the bitstream isn't active or queued, `access` first queues a load (the same as `q55 prog`, with the same `-t`).
 - `-t` is your minimum access time (default 10 minutes), counted from when access is granted.
 - When it runs out:
@@ -66,17 +54,27 @@ when the session runs a long command or was left open somewhere else.
 - Inside the session these variables are set:
   - `Q55_ACCESS=1`
   - `Q55_BITSTREAM=<path>`
-  - `Q55_UART=/dev/ttyUSB2` (the card's UART, FT4232H channel C)
 
 Examples:
 
 ```
-q55 access ~/proj/build/my_design.bit -t 20                      # shell
-q55 access ~/proj/build/my_design.bit -- python3 my_test.py      # one command
+q55 access <path_to_your_bitstream_file> -t 20                   # shell
+q55 access <path_to_your_bitstream_file> -- <cmd> <args>         # one command
 ```
 
-Access is enforced only for users who go through `q55`. The UART device and the board itself
-are not locked, so everybody must use `q55 access` to get predictable results.
+Access is enforced only for users who go through `q55`. The board and its devices are
+not locked, so everybody must use `q55 access` to get predictable results.
+
+### q55 release
+
+Releases your board access right away, even if your `-t` time isn't over, and cancels any of your access
+requests that are still waiting. Use it from inside the session or from any other terminal, for example
+when the session runs a long command or was left open somewhere else.
+
+- Your session's shell or command is ended at once (SIGHUP, then SIGKILL), with no 60-second warning,
+  and the board goes to the next user. `q55 access` then exits with code 0.
+- The bitstream stays loaded, and its allocation window doesn't change.
+- `enics` can run `q55 release` to end anyone's session, for example one left open by mistake.
 
 ### Scheduling rules
 
@@ -96,7 +94,7 @@ These were checked on enics-ThinkStation-P5:
 
 - Python 3.9 or newer (the machine has 3.12). `q55.py` uses only the standard library.
 - Vivado Lab at `/tools/Xilinx/2026.1/Vivado_Lab` (the path is set in `program.sh`).
-- The card's JTAG/UART cable (FT4232H) is connected, and its UART is `/dev/ttyUSB2`.
+- The card's JTAG cable (FT4232H) is connected.
 - The `enics` account has sudo rights.
 
 ### Where the files live
@@ -205,7 +203,7 @@ Typical session from your own account:
 
 ```
 q55 status                                           # is the manager running, and what is loaded?
-q55 access ~/proj/build/my_design.bit -t 20          # wait for the board, load if needed, open a shell
+q55 access <path_to_your_bitstream_file> -t 20      # queue an access request, load if needed, open a shell
 <your own commands>                                  # inside the (q55) shell: use the board
 exit                                                 # release the board for the next user
 ```
@@ -213,16 +211,12 @@ exit                                                 # release the board for the
 Or run one command and release the board when it ends:
 
 ```
-q55 access ~/proj/build/my_design.bit -- <your command and its arguments>
+q55 access <path_to_your_bitstream_file> -- <your command and its arguments>
 ```
 
-Inside the session you can run any program, in any way: Python scripts, terminal programs on the
-UART, your own test environment, and so on. `q55` doesn't care what you run. It only makes sure nobody else gets the
+Inside the session you can run any program, in any way: Python scripts, terminal programs, your own
+test environment, and so on. `q55` doesn't care what you run. It only makes sure nobody else gets the
 board while your session lasts.
-
-`$Q55_UART` holds the card UART device (`/dev/ttyUSB2`). Using it is optional: it saves you hard-coding the device
-name in your scripts. For example, `python3 my_test.py --port $Q55_UART`, where `--port` is an option of
-your own script, not of `q55`. `/dev/ttyUSB2` works just as well.
 
 Don't load bitstreams yourself (Vivado Hardware Manager, `program.sh`) during a session. The manager wouldn't
 know about the load, so `q55 status` would show the wrong bitstream and the next user would get

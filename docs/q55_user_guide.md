@@ -9,10 +9,10 @@ Run `q55` from your own account. Nothing needs to be installed.
 ## Quick start
 
 ```
-q55 status                                   # what is loaded, who holds the board, who is waiting
-q55 access ~/proj/build/my_design.bit -t 20  # wait for the board, load the bitstream if needed, open a shell
-<your own commands>                          # inside the (q55) shell: use the board
-exit                                         # release the board for the next user
+q55 status                                         # what is loaded, who holds the board, who is waiting
+q55 access <path_to_your_bitstream_file> -t 20     # queue an access request, load the bitstream if needed, open a shell
+<your own commands>                                # inside the (q55) shell: use the board
+exit                                               # release the board for the next user
 ```
 
 ## Commands
@@ -20,7 +20,7 @@ exit                                         # release the board for the next us
 | Command | What it does |
 |---------|--------------|
 | `q55 status` | Shows the loaded bitstream, the current board holder, the queues and recent events. |
-| `q55 access <bit> [-t <min>]` | Waits for exclusive use of the board, then opens a shell. Loads `<bit>` first if needed. |
+| `q55 access <bit> [-t <min>]` | Queues an access request. When your turn comes, you get exclusive use of the board in a new shell. Loads `<bit>` first if needed. |
 | `q55 access <bit> [-t <min>] -- <cmd>` | The same, but runs `<cmd>` and releases the board when it ends. |
 | `q55 prog <bit> [-t <min>]` | Only queues a load of `<bit>` and returns right away. It doesn't give you the board. |
 | `q55 release` | Releases your board access now, even before your `-t` is over, and cancels your waiting access requests. |
@@ -34,7 +34,7 @@ exit                                         # release the board for the next us
 2. **Load.** If your bitstream isn't loaded, it is loaded for you. This can take a minute or two.
 3. **Use the board.** You get a new shell in the same directory, with the prompt marked `(q55)`.
    You hold the board as long as that shell is open. Run anything you like there: Python scripts,
-   a terminal program on the UART, your own test setup, and so on.
+   terminal programs, your own test setup, and so on.
 4. **Release.** Type `exit`. You are back in your original shell, and the next user gets the board.
    Or run `q55 release`, from inside the session or from any other terminal. It ends your session at once,
    even if your `-t` time isn't over, and also cancels any of your access requests that are still waiting.
@@ -45,7 +45,6 @@ Inside the session these environment variables are set (using them is optional):
 
 | Variable | Value |
 |----------|-------|
-| `Q55_UART` | `/dev/ttyUSB2`, the card UART |
 | `Q55_BITSTREAM` | the full path of the loaded bitstream |
 | `Q55_ACCESS` | `1`, so your scripts can check that they run inside a session |
 
@@ -75,7 +74,7 @@ Messages you may see when you ask for a bitstream:
 
 ## Rules
 
-- **Always go through `q55 access`.** The UART and the board aren't locked. Anyone who uses them
+- **Always go through `q55 access`.** The board and its devices aren't locked. Anyone who uses them
   outside a session disturbs whoever holds the board.
 - **Don't load bitstreams yourself** (Vivado Hardware Manager, `program.sh`). The queue manager wouldn't
   know about the load, and the next user would get the wrong image. Using Vivado for debugging without

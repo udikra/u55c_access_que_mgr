@@ -4,7 +4,7 @@
 #
 #   q55 server                                          run the queue manager (enics account , forever)
 #   q55 prog   <bitstream> [-t <minutes>]               queue a bitstream load request
-#   q55 access <bitstream> [-t <minutes>] [-- <cmd>]    exclusive board access , loads the bitstream if needed
+#   q55 access <bitstream> [-t <minutes>] [-- <cmd>]    queue an access request , exclusive board access , loads the bitstream if needed
 #   q55 status                                          queue status
 #   q55 release                                         release your board access now , cancel your waiting access requests
 #   q55 shutdown                                        graceful queue manager shutdown (enics account)
@@ -43,7 +43,6 @@ GRACE_SEC  = float(os.environ.get('Q55_GRACE_SEC','60'))      # warning before a
 DEF_MIN    = 10                                               # default allocation minutes
 LOAD_TIMEOUT_SEC = 900
 SUDO_KEEPALIVE_SEC = 240
-UART_DEV   = '/dev/ttyUSB2'                                   # FT4232H channel C
 
 #----------------------------------------------------------------------------------------
 
@@ -564,7 +563,7 @@ def access_cmd(bit, t, cmd) :
          signal.signal(signal.SIGTTOU,signal.SIG_IGN)
          os.tcsetpgrp(0,os.getpgrp())
          signal.signal(signal.SIGTTOU,signal.SIG_DFL)
-   env = dict(os.environ, Q55_ACCESS='1', Q55_BITSTREAM=os.path.realpath(bit), Q55_UART=UART_DEV)
+   env = dict(os.environ, Q55_ACCESS='1', Q55_BITSTREAM=os.path.realpath(bit))
    rcfile = None
    if not cmd :
       sh = os.environ.get('SHELL','/bin/bash')
@@ -578,8 +577,7 @@ def access_cmd(bit, t, cmd) :
          rcfile = f.name
          cmd = [sh,'--rcfile',rcfile,'-i']
       print('*** q55: you now hold the U55C board. This is a new shell (prompt marked (q55)) in the same directory.\n'
-            '*** Run your tests here , the board UART is %s ($Q55_UART).\n'
-            '*** Type exit to release the board for the next user.' % UART_DEV,flush=True)
+            '*** Run your work here , then type exit (or q55 release) to release the board for the next user.',flush=True)
    p = subprocess.Popen(cmd,env=env,preexec_fn=child_setup)
    ended = [None]   # 'revoked' or 'released' when the manager ends the session
 
@@ -617,20 +615,25 @@ def main() :
    if '--' in argv :
       i = argv.index('--')
       argv, cmd = argv[:i], argv[i+1:]
+   # The manager commands are listed in the help only for the manager user (and root)
+   mgr = os.getuid() == 0 or pwd.getpwuid(os.getuid()).pw_name == MGR_USER
+   ops = ['prog','access','status','release'] + (['server','shutdown'] if mgr else [])
    ap = argparse.ArgumentParser(prog='q55',description='Alveo U55C board access queue manager')
-   sub = ap.add_subparsers(dest='op',required=True)
-   sub.add_parser('server',help='run the queue manager (%s account)' % MGR_USER)
+   sub = ap.add_subparsers(dest='op',required=True,metavar='{%s}' % ','.join(ops))
+   def mgr_help(hlp) :
+      return dict(help=hlp) if mgr else {}   # add_parser without help= is not listed
    for op,hlp in (('prog','queue a bitstream load request'),
-                  ('access','wait for exclusive board access , loading the bitstream if needed ; '
-                            'runs <cmd> (after --) or a shell')) :
+                  ('access','queue an access request : waits for exclusive board access , loads the bitstream '
+                            'if needed , then runs <cmd> (after --) or a shell')) :
       p = sub.add_parser(op,help=hlp)
       p.add_argument('bitstream')
       p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
                      help='allocation time once loaded / granted (default %d min)' % DEF_MIN)
    sub.add_parser('status',help='queue status')
-   sub.add_parser('release',help='release your board access now (even before -t is over) , '
-                                 'and cancel your waiting access requests')
-   sub.add_parser('shutdown',help='graceful queue manager shutdown (%s account)' % MGR_USER)
+   sub.add_parser('release',help='release your board access now (even before -t is over) and '
+                                 'cancel your waiting access requests')
+   sub.add_parser('server',**mgr_help('run the queue manager (%s account)' % MGR_USER))
+   sub.add_parser('shutdown',**mgr_help('graceful queue manager shutdown (%s account)' % MGR_USER))
    args = ap.parse_args(argv)
 
    if cmd and args.op != 'access' :
