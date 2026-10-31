@@ -82,32 +82,46 @@ These were checked on enics-ThinkStation-P5:
 - The card's JTAG/UART cable (FT4232H) is connected, and its UART is `/dev/ttyUSB2`.
 - The `enics` account has sudo rights.
 
-### Step 1: copy the repository files to the lab machine
+### Where the files live
 
-You need the four files `q55`, `q55.py`, `program.sh` and `jtag_program.tcl`. Use either option.
+| Location | Owner | Purpose |
+|----------|-------|---------|
+| `/home/enics/u55c_server` | enics | enics's working copy of this repository. Updates arrive here first. Other users can't read `/home/enics`, and it stays that way. |
+| `/opt/q55` | root | The installed copy that everyone runs, readable by all users. It is copied from `/home/enics/u55c_server`. |
+| `/usr/local/bin/q55` | root | Symlink to `/opt/q55/q55`, so `q55` is on every user's `PATH`. |
 
-Option A: clone from GitHub on the lab machine. This needs an account with access to the repository.
+Always run the tool from `/opt/q55`, even as enics: other users can't reach `/home/enics/u55c_server`.
 
-```
-cd /tmp
-git clone git@github.com:udikra/u55c_access_que_mgr.git
-```
+### Step 1: get the repository into /home/enics/u55c_server (as enics)
 
-Option B: copy from a Windows checkout with `scp`. Use an account that has an SSH key on the lab machine, for example `udi`:
+Use either option.
 
-```
-scp q55 q55.py program.sh jtag_program.tcl udi@<lab-machine>:/tmp/u55c_access_que_mgr/
-```
-
-Create the target directory first with `ssh udi@<lab-machine> mkdir -p /tmp/u55c_access_que_mgr`.
-
-### Step 2: install under /opt/q55 (as enics)
-
-Other users can't read `/home/enics`, so the tool goes under `/opt`, where everyone can read it:
+Option A: clone from GitHub. The enics account needs read access to the repository,
+for example through a GitHub deploy key, or HTTPS with a token.
 
 ```
 su - enics
-cd /tmp/u55c_access_que_mgr
+git clone git@github.com:udikra/u55c_access_que_mgr.git ~/u55c_server
+```
+
+Option B: copy from a Windows checkout. enics has no SSH key on the lab machine. Copy the files as
+`udi` to a folder enics can read (`udi`'s workspace), then copy them into place as enics:
+
+```
+# on Windows, in the repository folder:
+ssh udi@<lab-machine> mkdir -p /home/enics/users_workspace/udi/q55_files
+scp q55 q55.py program.sh jtag_program.tcl README.md udi@<lab-machine>:/home/enics/users_workspace/udi/q55_files/
+
+# on the lab machine:
+su - enics
+mkdir -p ~/u55c_server
+cp /home/enics/users_workspace/udi/q55_files/* ~/u55c_server/
+```
+
+### Step 2: install from /home/enics/u55c_server into /opt/q55 (as enics)
+
+```
+cd ~/u55c_server
 sudo install -d -m 755 /opt/q55
 sudo install -m 755 q55 q55.py program.sh /opt/q55/
 sudo install -m 644 jtag_program.tcl /opt/q55/
@@ -120,20 +134,21 @@ sudo ln -sf /opt/q55/q55 /usr/local/bin/q55
 ```
 which q55                 # /usr/local/bin/q55
 q55 -h                    # usage text, from any account
-q55 status                # "the U55C queue manager is not running" until Step 4
+q55 status                # "the U55C queue manager is not running" until the manager is started (see below)
 ```
 
 ### Updating to a new version
 
 1. Stop the manager with `q55 shutdown`, as enics.
-2. Repeat Steps 1 and 2. The `install` command overwrites the old files.
-3. Start the manager again (see below). The active bitstream is restored from `~/.q55_state.json`.
+2. Update `/home/enics/u55c_server`: run `cd ~/u55c_server && git pull` (Option A), or copy the new files again (Option B).
+3. Repeat Step 2. The `install` command overwrites the old files in `/opt/q55`.
+4. Start the manager again (see below). The active bitstream is restored from `~/.q55_state.json`.
 
 ### Uninstalling
 
 ```
 sudo rm -rf /opt/q55 /usr/local/bin/q55
-rm -f ~/.q55_state.json ~/.q55.log        # as enics
+rm -rf ~/u55c_server ~/.q55_state.json ~/.q55.log        # as enics
 ```
 
 ## Running the manager (enics)
