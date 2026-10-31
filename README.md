@@ -73,26 +73,83 @@ are not locked, so everybody must use `q55 access` to get predictable results.
 
 ## Installation (once, on the lab machine, as enics)
 
-Other users can't read `/home/enics`, so install under `/opt`:
+### Prerequisites
+
+These were checked on enics-ThinkStation-P5:
+
+- Python 3.9 or newer (the machine has 3.12). `q55.py` uses only the standard library.
+- Vivado Lab at `/tools/Xilinx/2026.1/Vivado_Lab` (the path is set in `program.sh`).
+- The card's JTAG/UART cable (FT4232H) is connected, and its UART is `/dev/ttyUSB2`.
+- The `enics` account has sudo rights.
+
+### Step 1: copy the repository files to the lab machine
+
+You need the four files `q55`, `q55.py`, `program.sh` and `jtag_program.tcl`. Use either option.
+
+Option A: clone from GitHub on the lab machine. This needs an account with access to the repository.
 
 ```
-# from a clone (or copy) of this repository on the lab machine:
-cd u55c_access_que_mgr
-sudo mkdir -p /opt/q55
-sudo cp q55 q55.py program.sh jtag_program.tcl /opt/q55
-sudo chmod 755 /opt/q55/q55 /opt/q55/q55.py /opt/q55/program.sh
+cd /tmp
+git clone git@github.com:udikra/u55c_access_que_mgr.git
+```
+
+Option B: copy from a Windows checkout with `scp`. Use an account that has an SSH key on the lab machine, for example `udi`:
+
+```
+scp q55 q55.py program.sh jtag_program.tcl udi@<lab-machine>:/tmp/u55c_access_que_mgr/
+```
+
+Create the target directory first with `ssh udi@<lab-machine> mkdir -p /tmp/u55c_access_que_mgr`.
+
+### Step 2: install under /opt/q55 (as enics)
+
+Other users can't read `/home/enics`, so the tool goes under `/opt`, where everyone can read it:
+
+```
+su - enics
+cd /tmp/u55c_access_que_mgr
+sudo install -d -m 755 /opt/q55
+sudo install -m 755 q55 q55.py program.sh /opt/q55/
+sudo install -m 644 jtag_program.tcl /opt/q55/
+sudo sed -i 's/\r$//' /opt/q55/*                  # strip Windows line endings, if any
 sudo ln -sf /opt/q55/q55 /usr/local/bin/q55
 ```
 
-Files copied from Windows need `sed -i 's/\r$//' /opt/q55/*`.
+### Step 3: check the installation
+
+```
+which q55                 # /usr/local/bin/q55
+q55 -h                    # usage text, from any account
+q55 status                # "the U55C queue manager is not running" until Step 4
+```
+
+### Updating to a new version
+
+1. Stop the manager with `q55 shutdown`, as enics.
+2. Repeat Steps 1 and 2. The `install` command overwrites the old files.
+3. Start the manager again (see below). The active bitstream is restored from `~/.q55_state.json`.
+
+### Uninstalling
+
+```
+sudo rm -rf /opt/q55 /usr/local/bin/q55
+rm -f ~/.q55_state.json ~/.q55.log        # as enics
+```
 
 ## Running the manager (enics)
 
-Start it in a terminal that stays open, for example the tmux session `shared`:
+The manager must run as `enics`, and only one manager can run at a time. Start it in a terminal that
+stays open after you log out. Use tmux so it survives a disconnect:
 
 ```
-q55 server
+tmux new -s q55           # or attach to an existing session: tmux attach -t shared
+su - enics                # skip this if you are already enics
+q55 server                # enter the enics password when sudo asks
 ```
+
+Detach with `Ctrl-b d`. The manager keeps running. To see it again, run `tmux attach -t q55`.
+
+After a reboot of the lab machine, start the manager again: it isn't started automatically.
 
 - It asks for the enics sudo password once, then keeps the sudo credential alive (`sudo -n -v` every 4 minutes).
 - The terminal shows the manager log. The log is also kept in `~/.q55.log`.
@@ -104,14 +161,43 @@ q55 server
 If the manager loses its sudo credential, loads fail with a clear message. In that case restart
 the manager. Alternatively, a sudoers `NOPASSWD` rule for `setpci` and `tee` removes the need for the password.
 
+## Using q55 (all users)
+
+You don't need to install anything. `q55` is in `/usr/local/bin`, which is already in every user's `PATH`.
+If `q55` isn't found, run `/opt/q55/q55` or add `/usr/local/bin` to your `PATH`.
+
+Typical session from your own account:
+
+```
+q55 status                                           # is the manager running, and what is loaded?
+q55 access ~/proj/build/my_design.bit -t 20          # wait for the board, load if needed, open a shell
+python3 my_test.py --port $Q55_UART                  # inside the shell: use the board
+exit                                                 # release the board for the next user
+```
+
+Or run one command and release the board when it ends:
+
+```
+q55 access ~/proj/build/my_design.bit -- python3 my_test.py
+```
+
+The bitstream must be a file you can read. Its path doesn't need to be readable by `enics`.
+If you see `the U55C queue manager is not running`, ask whoever runs the enics account to start `q55 server`.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `q55` | Wrapper script (`python3 q55.py`) |
+| `q55` | The command users run. A short bash wrapper that finds its real location (following the `/usr/local/bin/q55` symlink) and runs `q55.py` from there. See below. |
 | `q55.py` | Queue manager and client (Python 3 standard library only) |
 | `program.sh` | JTAG load with PCIe link disable. Copied from u55c_py_access, with `sudo -n` |
 | `jtag_program.tcl` | Vivado Lab JTAG programming |
+
+Why `q55` is a wrapper and not a direct link to `q55.py`: the manager finds `program.sh` next to `q55.py`
+(`os.path.abspath(__file__)`). Python doesn't resolve symlinks there, so if `/usr/local/bin/q55` pointed straight
+at `q55.py`, it would look for `/usr/local/bin/program.sh`. The wrapper runs `readlink -f` first, so the
+symlink works. It uses `exec`, so no extra process stays between the user's terminal and `q55.py`.
+Signals, the terminal foreground and the exit code reach `q55.py` directly.
 
 ## How it works
 
