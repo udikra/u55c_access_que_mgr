@@ -6,7 +6,7 @@
 #   q55 prog   <bitstream> [-t <minutes>]               queue a bitstream load request
 #   q55 access <bitstream> [-t <minutes>] [-- <cmd>]    exclusive board access , loads the bitstream if needed
 #   q55 status                                          queue status
-#   q55 shutdown                                        graceful queue manager shutdown
+#   q55 shutdown                                        graceful queue manager shutdown (enics account)
 #
 # See README.md
 
@@ -21,6 +21,7 @@ import struct
 import signal
 import shutil
 import argparse
+import tempfile
 import threading
 import subprocess
 from collections import deque
@@ -111,6 +112,9 @@ class Mgr :
 
    def same_file(self, e, path, ver) :
       return e is not None and e['path'] == path and e['ver'] == ver
+
+   def loading_msg(self) :
+      return 'Loading %s now , this can take a minute or two' % self.loading['path']
 
    #-------------------------------------------------------------------------------------
 
@@ -278,6 +282,9 @@ class Mgr :
                   close_conn(w['conn'])
                   self.waiters.remove(w)
          self.loading = self.loads.pop(0)
+         for w in self.waiters :
+            if w['path'] == self.loading['path'] :
+               send(w['conn'],'info',self.loading_msg())
          threading.Thread(target=self.run_load,args=(self.loading,),daemon=True).start()
          return
 
@@ -390,6 +397,8 @@ class Mgr :
          log('%s waits for access (%s , %g min)' % (user,w['path'],w['t']))
          send(conn,'info','%s\nWaiting for board access (%d in the access queue) , Ctrl-C to cancel'
               % (load_msg,len(self.waiters)))
+         if self.loading and self.loading['path'] == w['path'] :
+            send(conn,'info',self.loading_msg())   # the load started before this waiter was queued
          self.cv.notify_all()
       # The session lasts while the client keeps the connection open
       while True :
@@ -527,9 +536,21 @@ def access_cmd(bit, t, cmd) :
          os.tcsetpgrp(0,os.getpgrp())
          signal.signal(signal.SIGTTOU,signal.SIG_DFL)
    env = dict(os.environ, Q55_ACCESS='1', Q55_BITSTREAM=os.path.realpath(bit), Q55_UART=UART_DEV)
+   rcfile = None
    if not cmd :
-      cmd = [os.environ.get('SHELL','/bin/bash'),'-i']
-      print('*** q55: U55C access shell , type exit to release the board ***',flush=True)
+      sh = os.environ.get('SHELL','/bin/bash')
+      cmd = [sh,'-i']
+      if os.path.basename(sh) == 'bash' :
+         # Mark the access shell prompt with (q55) , after the user's own bashrc
+         with tempfile.NamedTemporaryFile('w',prefix='q55_',suffix='.bashrc',delete=False) as f :
+            f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
+                    '[ -f ~/.bashrc ] && . ~/.bashrc\n'
+                    'PS1="(q55) $PS1"\n')
+         rcfile = f.name
+         cmd = [sh,'--rcfile',rcfile,'-i']
+      print('*** q55: you now hold the U55C board. This is a new shell (prompt marked (q55)) in the same directory.\n'
+            '*** Run your tests here , the board UART is %s ($Q55_UART).\n'
+            '*** Type exit to release the board for the next user.' % UART_DEV,flush=True)
    p = subprocess.Popen(cmd,env=env,preexec_fn=child_setup)
    revoked = [False]
 
@@ -550,6 +571,8 @@ def access_cmd(bit, t, cmd) :
    threading.Thread(target=watch,daemon=True).start()
    signal.signal(signal.SIGINT,signal.SIG_IGN)
    rc = p.wait()
+   if rcfile :
+      os.remove(rcfile)
    if tty :
       signal.signal(signal.SIGTTOU,signal.SIG_IGN)
       os.tcsetpgrp(0,os.getpgrp())
@@ -576,7 +599,7 @@ def main() :
       p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
                      help='allocation time once loaded / granted (default %d min)' % DEF_MIN)
    sub.add_parser('status',help='queue status')
-   sub.add_parser('shutdown',help='graceful queue manager shutdown')
+   sub.add_parser('shutdown',help='graceful queue manager shutdown (%s account)' % MGR_USER)
    args = ap.parse_args(argv)
 
    if cmd and args.op != 'access' :

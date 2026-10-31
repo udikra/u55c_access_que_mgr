@@ -38,6 +38,11 @@ Queues a load of the bitstream and returns right away. The command doesn't wait 
 Waits for exclusive use of the board, then runs `<cmd>` or, if you give no command, an
 interactive shell. The board is released when the command or shell exits.
 
+- Loading a bitstream can take a minute or two. `q55` prints `Loading <path> now` when the load starts.
+- With no command, you get a new shell (a child of `q55`) in the same directory. Its prompt starts with
+  `(q55)` (bash only), much like a Python virtualenv prompt. You hold the board for as long as this shell is open:
+  run your tests there, then type `exit` to release the board and return to your original shell.
+
 - If the bitstream isn't active or queued, `access` first queues a load (the same as `q55 prog`, with the same `-t`).
 - `-t` is your minimum access time (default 10 minutes), counted from when access is granted.
 - When it runs out:
@@ -104,19 +109,22 @@ su - enics
 git clone git@github.com:udikra/u55c_access_que_mgr.git ~/u55c_server
 ```
 
-Option B: copy from a Windows checkout. enics has no SSH key on the lab machine. Copy the files as
-`udi` to a folder enics can read (`udi`'s workspace), then copy them into place as enics:
+Option B: copy from a Windows checkout. enics has no SSH key on the lab machine, so do it in two steps.
+First copy the files, under your own lab account, to your workspace `/home/enics/users_workspace/$USER`
+(any folder enics can read works). Then copy them into place as enics:
 
 ```
-# on Windows, in the repository folder:
-ssh udi@<lab-machine> mkdir -p /home/enics/users_workspace/udi/q55_files
-scp q55 q55.py program.sh jtag_program.tcl README.md udi@<lab-machine>:/home/enics/users_workspace/udi/q55_files/
+# on Windows (Git Bash), in the repository folder. LAB_USER is your account on the lab machine:
+LAB_USER=<your lab account>
+ssh $LAB_USER@<lab-machine> mkdir -p /home/enics/users_workspace/$LAB_USER/q55_files
+scp q55 q55.py program.sh jtag_program.tcl README.md $LAB_USER@<lab-machine>:/home/enics/users_workspace/$LAB_USER/q55_files/
 
-# on the lab machine:
-su - enics
-mkdir -p ~/u55c_server
-cp /home/enics/users_workspace/udi/q55_files/* ~/u55c_server/
+# on the lab machine, logged in as your own account:
+su - enics -c "mkdir -p ~/u55c_server && cp /home/enics/users_workspace/$USER/q55_files/* ~/u55c_server/"
 ```
+
+The double quotes matter: `$USER` is replaced with your account name before `su` switches to enics.
+After `su - enics`, `$USER` is `enics`.
 
 ### Step 2: install from /home/enics/u55c_server into /opt/q55 (as enics)
 
@@ -186,15 +194,27 @@ Typical session from your own account:
 ```
 q55 status                                           # is the manager running, and what is loaded?
 q55 access ~/proj/build/my_design.bit -t 20          # wait for the board, load if needed, open a shell
-python3 my_test.py --port $Q55_UART                  # inside the shell: use the board
+<your own commands>                                  # inside the (q55) shell: use the board
 exit                                                 # release the board for the next user
 ```
 
 Or run one command and release the board when it ends:
 
 ```
-q55 access ~/proj/build/my_design.bit -- python3 my_test.py
+q55 access ~/proj/build/my_design.bit -- <your command and its arguments>
 ```
+
+Inside the session you can run any program, in any way: Python scripts, terminal programs on the
+UART, your own test environment, and so on. `q55` doesn't care what you run. It only makes sure nobody else gets the
+board while your session lasts.
+
+`$Q55_UART` holds the card UART device (`/dev/ttyUSB2`). Using it is optional: it saves you hard-coding the device
+name in your scripts. For example, `python3 my_test.py --port $Q55_UART`, where `--port` is an option of
+your own script, not of `q55`. `/dev/ttyUSB2` works just as well.
+
+Don't load bitstreams yourself (Vivado Hardware Manager, `program.sh`) during a session. The manager wouldn't
+know about the load, so `q55 status` would show the wrong bitstream and the next user would get
+an unexpected image. Always load through `q55 prog` or `q55 access`.
 
 The bitstream must be a file you can read. Its path doesn't need to be readable by `enics`.
 If you see `the U55C queue manager is not running`, ask whoever runs the enics account to start `q55 server`.
