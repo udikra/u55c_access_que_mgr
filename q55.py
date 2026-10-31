@@ -54,8 +54,18 @@ def log(msg) :
     except OSError :
        pass
 
+# The manager times everything with time.monotonic() , so that a system clock change (NTP , date)
+# can't stretch or cut an allocation window ; the wall clock is used only to show times.
+
+def mono_to_wall(t) :
+    return t + time.time() - time.monotonic()
+
+def wall_to_mono(t) :
+    return t - time.time() + time.monotonic()
+
 def hhmm(t) :
-    return datetime.fromtimestamp(t).strftime('%H:%M')
+    # t is a time.monotonic() value
+    return datetime.fromtimestamp(mono_to_wall(t)).strftime('%H:%M')
 
 def dur(sec) :
     sec = max(0,int(sec))
@@ -101,10 +111,10 @@ class Mgr :
 
    def event(self, msg) :
       log(msg)
-      self.events.append(hhmm(time.time()) + '  ' + msg)
+      self.events.append(hhmm(time.monotonic()) + '  ' + msg)
 
    def window_left(self) :
-      return self.active['loaded_at'] + self.active['t']*60 - time.time() if self.active else 0
+      return self.active['loaded_at'] + self.active['t']*60 - time.monotonic() if self.active else 0
 
    def load_due(self) :
       # A pending load replaces the active bitstream once its allocation window is over
@@ -120,7 +130,9 @@ class Mgr :
 
    def save_state(self) :
       try :
-         with open(STATE_FILE,'w') as f : json.dump(self.active,f)
+         # The state file keeps wall clock time , monotonic time is meaningless in another run
+         a = self.active and dict(self.active, loaded_at=mono_to_wall(self.active['loaded_at']))
+         with open(STATE_FILE,'w') as f : json.dump(a,f)
       except OSError as x :
          log('WARNING: cannot save state: %s' % x)
 
@@ -133,6 +145,8 @@ class Mgr :
          a['ver'] = tuple(a['ver'])
          a['restored'] = True
          if not os.path.exists(a.get('snap') or '') : a['snap'] = None
+         # A load time in the future means the clock was set back since , count from now
+         a['loaded_at'] = wall_to_mono(min(a['loaded_at'],time.time()))
          self.active = a
          log('Restored from the previous run: %s (loaded by %s at %s) , not verified on the board'
              % (a['path'],a['user'],hhmm(a['loaded_at'])))
@@ -167,7 +181,7 @@ class Mgr :
             return ('PENDING: %s is in the load queue at position %d , updated to the newer file' % (path,i+1), False)
       if snap is None : return (None, True)
       changed = ' (changed since it was loaded)' if a and a['path'] == path else ''
-      self.loads.append(dict(path=path, ver=ver, snap=snap, user=user, t=t, req_at=time.time()))
+      self.loads.append(dict(path=path, ver=ver, snap=snap, user=user, t=t, req_at=time.monotonic()))
       self.event('%s queued a load of %s%s' % (user,path,changed))
       self.cv.notify_all()
       pos = len(self.loads)
@@ -213,7 +227,7 @@ class Mgr :
       with self.cv :
          self.loading = None
          if ok :
-            self.active = dict(e, loaded_at=time.time())
+            self.active = dict(e, loaded_at=time.monotonic())
             self.save_state()
             self.event('Loaded %s (requested by %s , allocation %g min)' % (e['path'],e['user'],e['t']))
             for w in self.waiters :
@@ -237,7 +251,7 @@ class Mgr :
    # Scheduler , called every second and on every queue change , with the lock held
 
    def tick(self) :
-      now = time.time()
+      now = time.monotonic()
       h = self.holder
       if h :
          a = self.active
@@ -312,7 +326,7 @@ class Mgr :
       h = self.holder
       if h and (h['user'] == user or admin) :
          send(h['conn'],'released','board access released by %s' % user)
-         self.event('Access of %s released by %s after %s' % (h['user'],user,dur(time.time() - h['granted_at'])))
+         self.event('Access of %s released by %s after %s' % (h['user'],user,dur(time.monotonic() - h['granted_at'])))
          close_conn(h['conn'])
          self.holder = None
          done.append('released the board access of %s' % h['user'])
@@ -330,7 +344,7 @@ class Mgr :
       return 'q55 release: ' + ' , '.join(done)
 
    def status_text(self) :
-      now = time.time()
+      now = time.monotonic()
       L = ['U55C queue manager on %s , run by %s since %s' % (socket.gethostname(),pwd.getpwuid(os.getuid()).pw_name,
            datetime.fromtimestamp(self.started).strftime('%Y-%m-%d %H:%M'))]
       if self.stopping :
@@ -418,7 +432,7 @@ class Mgr :
       with self.cv :
          self.seq += 1
          w = dict(id=self.seq, user=user, path=req['path'], t=float(req['t']), conn=conn,
-                  req_at=time.time(), granted_at=None, warned_at=None)
+                  req_at=time.monotonic(), granted_at=None, warned_at=None)
          if self.stopping :
             raise Refused('the queue manager is shutting down')
          self.waiters.append(w)
@@ -437,7 +451,7 @@ class Mgr :
       with self.cv :
          if self.holder is w :
             self.holder = None
-            self.event('Access released by %s after %s' % (user,dur(time.time() - w['granted_at'])))
+            self.event('Access released by %s after %s' % (user,dur(time.monotonic() - w['granted_at'])))
          elif w in self.waiters :
             self.waiters.remove(w)
             log('%s cancelled the access request' % user)
@@ -591,8 +605,8 @@ def access_cmd(bit, t, cmd) :
                   os.killpg(p.pid,sig)
                except ProcessLookupError :
                   return
-               end = time.time() + wait
-               while p.poll() is None and time.time() < end : time.sleep(0.1)
+               end = time.monotonic() + wait
+               while p.poll() is None and time.monotonic() < end : time.sleep(0.1)
             return
 
    threading.Thread(target=watch,daemon=True).start()
