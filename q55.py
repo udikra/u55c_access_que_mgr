@@ -6,7 +6,8 @@
 #   q55 prog   <bitstream> [-t <minutes>]               queue a bitstream load request
 #   q55 access <bitstream> [-t <minutes>] [-- <cmd>]    queue an access request , exclusive board access , loads the bitstream if needed
 #   q55 status                                          queue status
-#   q55 release                                         release your board access now , cancel your waiting access requests
+#   q55 release                                         end your turn : release your board access , end your bitstream
+#                                                       allocation window , cancel your waiting access requests
 #   q55 shutdown                                        graceful queue manager shutdown (enics account)
 #
 # See README.md
@@ -117,8 +118,16 @@ class Mgr :
       return self.active['loaded_at'] + self.active['t']*60 - time.monotonic() if self.active else 0
 
    def load_due(self) :
-      # A pending load replaces the active bitstream once its allocation window is over
-      return bool(self.loads) and (self.active is None or self.window_left() <= 0)
+      # A pending load replaces the active bitstream once its allocation window is over ,
+      # or at once when the user who loaded the active bitstream asks for it and nobody else holds
+      # or waits for that bitstream
+      if not self.loads :
+         return False
+      a = self.active
+      if a is None or self.window_left() <= 0 :
+         return True
+      others = [w for w in self.waiters + [self.holder] if w and w['path'] == a['path'] and w['user'] != a['user']]
+      return self.loads[0]['user'] == a['user'] and not others
 
    def same_file(self, e, path, ver) :
       return e is not None and e['path'] == path and e['ver'] == ver
@@ -320,8 +329,9 @@ class Mgr :
    #-------------------------------------------------------------------------------------
 
    def release(self, user, admin) :
-      # q55 release : ends the caller's access session at once (the manager user ends anyone's)
-      # and cancels the caller's waiting access requests. Called with the lock held.
+      # q55 release : the caller's turn is over. Ends the caller's access session at once (the manager
+      # user ends anyone's) , cancels the caller's waiting access requests , and ends the allocation
+      # window of the bitstream the caller loaded , unless other users wait for it. Called with the lock held.
       done = []
       h = self.holder
       if h and (h['user'] == user or admin) :
@@ -335,6 +345,13 @@ class Mgr :
          send(w['conn'],'error','access request cancelled by q55 release')
          close_conn(w['conn'])
          self.waiters.remove(w)
+      a = self.active
+      if a and (a['user'] == user or admin) and self.window_left() > 0 and \
+         not any(w['path'] == a['path'] and w['user'] != a['user'] for w in self.waiters) :
+         a['t'] = (time.monotonic() - a['loaded_at'])/60   # shorten the window to now , keep the load time
+         self.save_state()
+         self.event('Allocation window of %s ended by %s' % (a['path'],user))
+         done.append('ended the allocation window of %s (it stays loaded until another load is requested)' % a['path'])
       if mine :
          log('%s cancelled %d waiting access request(s)' % (user,len(mine)))
          done.append('cancelled %d waiting access request(s)' % len(mine))
@@ -644,8 +661,8 @@ def main() :
       p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
                      help='allocation time once loaded / granted (default %d min)' % DEF_MIN)
    sub.add_parser('status',help='queue status')
-   sub.add_parser('release',help='release your board access now (even before -t is over) and '
-                                 'cancel your waiting access requests')
+   sub.add_parser('release',help='end your turn now (even before -t is over) : release your board access , '
+                                 'end the allocation window of your bitstream and cancel your waiting access requests')
    sub.add_parser('server',**mgr_help('run the queue manager (%s account)' % MGR_USER))
    sub.add_parser('shutdown',**mgr_help('graceful queue manager shutdown (%s account)' % MGR_USER))
    args = ap.parse_args(argv)

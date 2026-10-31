@@ -13,7 +13,7 @@ Users run `q55` from their own accounts, which have no sudo rights.
 q55 prog   <bitstream_path> [-t <minutes>]               queue a bitstream load
 q55 access <bitstream_path> [-t <minutes>] [-- <cmd>]    queue an access request (exclusive board access)
 q55 status                                               queue status
-q55 release                                              release your board access now, cancel your waiting requests
+q55 release                                              end your turn: access, allocation window, waiting requests
 q55 shutdown                                             graceful manager shutdown (enics only)
 q55 server                                               run the queue manager (enics only)
 ```
@@ -23,7 +23,8 @@ q55 server                                               run the queue manager (
 Queues a load of the bitstream and returns right away. The command doesn't wait for the load.
 
 - `-t` is the allocation window (default 10 minutes), counted from the moment the bitstream is loaded.
-  - While the window is open, other bitstreams can't replace this one.
+  - While the window is open, other users' bitstreams can't replace this one. You can replace your own
+    bitstream at any time, as long as no other user holds the board on it or waits for it.
   - After the window closes, the bitstream stays loaded until another load is requested.
 - The loaded bitstream is available to every user who gives the same path.
 - If you ask for a different bitstream while another one is inside its window, you get a
@@ -67,19 +68,23 @@ not locked, so everybody must use `q55 access` to get predictable results.
 
 ### q55 release
 
-Releases your board access right away, even if your `-t` time isn't over, and cancels any of your access
-requests that are still waiting. Use it from inside the session or from any other terminal, for example
-when the session runs a long command or was left open somewhere else.
+Means "my turn is over". Use it from inside the session or from any other terminal, even if your `-t` time isn't over.
 
 - Your session's shell or command is ended at once (SIGHUP, then SIGKILL), with no 60-second warning,
   and the board goes to the next user. `q55 access` then exits with code 0.
-- The bitstream stays loaded, and its allocation window doesn't change.
+- The allocation window of the bitstream you loaded ends, so other users' pending loads can go ahead.
+  This is skipped if another user waits for that bitstream. The bitstream stays loaded until another load is requested.
+- Your access requests that are still waiting are cancelled.
+
+`exit` (or the end of `<cmd>`) only ends the session. Your bitstream keeps its allocation window, so you can come back to it.
 - `enics` can run `q55 release` to end anyone's session, for example one left open by mistake.
 
 ### Scheduling rules
 
 1. A pending load waits until the active bitstream's allocation window is over, and until
    the current access session is released or revoked (after its minimum time and the 60-second warning).
+   Exception: the user who loaded the active bitstream can replace it before its window is over, as long as
+   no other user holds the board on that bitstream or waits for it.
 2. Once the window is over, pending loads come before new access grants on the old bitstream.
    Users still waiting for the old bitstream have it queued again behind the pending loads.
 3. Access requests are served first come, first served among the users of the loaded bitstream.
