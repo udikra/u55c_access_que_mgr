@@ -10,9 +10,9 @@ Run `q55` from your own account. Nothing needs to be installed.
 
 ```
 q55 status                                         # what is loaded, who holds the board, who is waiting
-q55 access <path_to_your_bitstream_file> -t 20     # queue an access request, load the bitstream if needed, open a shell
-<your own commands>                                # inside the (q55) shell: use the board
-exit                                               # release the board for the next user
+q55 access <path_to_your_bitstream_file> -t 20     # queue an access request, load the bitstream if needed
+<your own commands>                                # use the board until your -t minutes are over
+q55 release                                        # done early: release the board for the next user
 ```
 
 ## Commands
