@@ -11,12 +11,14 @@ Users run `q55` from their own accounts, which have no sudo rights.
 
 ```
 q55 prog   <bitstream_path> [-t <minutes>]               queue a bitstream load
-q55 access <bitstream_path> [-t <minutes>] [-- <cmd>]    queue an access request (exclusive board access)
+q55 access <bitstream_path> [-t <minutes>]              queue an access request (exclusive board access)
 q55 status                                               queue status
 q55 release                                              end your turn: access, allocation window, waiting requests
 q55 shutdown                                             graceful manager shutdown (enics only)
 q55 server                                               run the queue manager (enics only)
 ```
+
+Every user command returns right away and never holds the terminal. The requests stay queued in the manager.
 
 ### q55 prog
 
@@ -37,52 +39,43 @@ Queues a load of the bitstream and returns right away. The command doesn't wait 
 
 ### q55 access
 
-Queues an access request. When your turn comes, you get exclusive use of the board, and `q55` runs `<cmd>`
-or, if you give no command, an interactive shell. The board is released when the command or shell exits.
+Queues an access request in the manager and returns right away. When your turn comes, the manager
+grants you exclusive use of the board. There is no session process and no special shell: while you hold the
+access, you use the board in any way, from any of your terminals on the lab machine.
 
-- Loading a bitstream can take a minute or two. `q55` prints `Loading <path> now` when the load starts.
-- With no command, you get a new shell (a child of `q55`) in the same directory. Its prompt starts with
-  `(q55)` (bash only), much like a Python virtualenv prompt. You hold the board for as long as this shell is open:
-  run your tests there, then type `exit` to release the board and return to your original shell.
+- `q55 access` answers `GRANTED` if the board was free and your bitstream is loaded, or `QUEUED` with your
+  position in the access queue. A repeated request for the same bitstream isn't queued twice.
+- Run `q55 status` to see when you hold the access: your name is shown as `Access holder`.
 - If the bitstream isn't active or queued, `access` first queues a load (the same as `q55 prog`, with the same `-t`).
+  Loading a bitstream can take a minute or two. If the load fails, the access requests for that bitstream are
+  dropped, and `q55 status` shows it under `Recent events`.
 - `-t` is your minimum access time (default 10 minutes), counted from when access is granted.
 - When it runs out:
   - **Nobody else is waiting:** you keep the board as long as you like.
   - **Someone else is waiting:** either another user wants this bitstream, or a load of a
-    different bitstream is due because the allocation window is over. You get a warning, and
-    60 seconds later your command or shell is ended with SIGHUP, then SIGKILL.
-- Ctrl-C while waiting cancels the request.
-- Inside the session these variables are set:
-  - `Q55_ACCESS=1`
-  - `Q55_BITSTREAM=<path>`
-
-Examples:
-
-```
-q55 access <path_to_your_bitstream_file> -t 20                   # shell
-q55 access <path_to_your_bitstream_file> -- <cmd> <args>         # one command
-```
+    different bitstream is due because the allocation window is over. 60 seconds later your access ends.
+    `q55 status` shows `revoked in m:ss` next to the holder during these 60 seconds.
+- `q55` never runs, watches or stops your programs. When your access ends, stop using the board.
+- `q55 release` ends your access, or cancels a request that is still waiting.
 
 Access is enforced only for users who go through `q55`. The board and its devices are
-not locked, so everybody must use `q55 access` to get predictable results.
+not locked, so everybody must use `q55 access`, and use the board only while `q55 status`
+shows them as the access holder, to get predictable results.
 
 ### q55 release
 
-Means "my turn is over". Use it from inside the session or from any other terminal, even if your `-t` time isn't over.
+Means "my turn is over". Run it from any terminal, even if your `-t` time isn't over.
 
-- Your session's shell or command is ended at once (SIGHUP, then SIGKILL), with no 60-second warning,
-  and the board goes to the next user. `q55 access` then exits with code 0.
+- Your board access ends at once, with no 60-second wait, and the board goes to the next user.
 - The allocation window of the bitstream you loaded ends, so other users' pending loads can go ahead.
   This is skipped if another user waits for that bitstream. The bitstream stays loaded until another load is requested.
 - Your access requests that are still waiting are cancelled.
-
-`exit` (or the end of `<cmd>`) only ends the session. Your bitstream keeps its allocation window, so you can come back to it.
-- `enics` can run `q55 release` to end anyone's session, for example one left open by mistake.
+- `enics` can run `q55 release` to end anyone's access, for example one a user forgot to release.
 
 ### Scheduling rules
 
 1. A pending load waits until the active bitstream's allocation window is over, and until
-   the current access session is released or revoked (after its minimum time and the 60-second warning).
+   the current board access is released or revoked (after its minimum time and 60 more seconds).
    Exception: the user who loaded the active bitstream can replace it before its window is over, as long as
    no other user holds the board on that bitstream or waits for it.
 2. Once the window is over, pending loads come before new access grants on the old bitstream.
@@ -194,7 +187,8 @@ After a reboot of the lab machine, start the manager again: it isn't started aut
 - The loaded bitstream is saved in `~/.q55_state.json` and restored after a restart.
   It is shown as not verified, because someone may have loaded the board by hand in the meantime.
 - Stop it with `q55 shutdown` (from enics) or Ctrl-C. Both are graceful: the manager waits
-  for a load in progress, and the access holder gets the 60-second warning. A second Ctrl-C exits at once.
+  for a load in progress, and the access holder keeps the board for 60 more seconds. Waiting access requests
+  are dropped. A second Ctrl-C exits at once.
 
 If the manager loses its sudo credential, loads fail with a clear message. In that case restart
 the manager. Alternatively, a sudoers `NOPASSWD` rule for `setpci` and `tee` removes the need for the password.
@@ -204,26 +198,21 @@ the manager. Alternatively, a sudoers `NOPASSWD` rule for `setpci` and `tee` rem
 You don't need to install anything. `q55` is in `/usr/local/bin`, which is already in every user's `PATH`.
 If `q55` isn't found, run `/opt/q55/q55` or add `/usr/local/bin` to your `PATH`.
 
-Typical session from your own account:
+Typical use, from any terminal of your own account on the lab machine:
 
 ```
 q55 status                                           # is the manager running, and what is loaded?
-q55 access <path_to_your_bitstream_file> -t 20      # queue an access request, load if needed, open a shell
-<your own commands>                                  # inside the (q55) shell: use the board
-exit                                                 # release the board for the next user
+q55 access <path_to_your_bitstream_file> -t 20      # queue an access request, load if needed
+q55 status                                           # check that you are the "Access holder"
+<your own commands>                                  # use the board, from any of your terminals
+q55 release                                          # release the board for the next user
 ```
 
-Or run one command and release the board when it ends:
+While you hold the access you can run any program, in any way, from any terminal: Python scripts,
+terminal programs, your own test environment, and so on. `q55` doesn't care what you run. It only
+makes sure nobody else is granted the board while you hold it.
 
-```
-q55 access <path_to_your_bitstream_file> -- <your command and its arguments>
-```
-
-Inside the session you can run any program, in any way: Python scripts, terminal programs, your own
-test environment, and so on. `q55` doesn't care what you run. It only makes sure nobody else gets the
-board while your session lasts.
-
-Don't load bitstreams yourself (Vivado Hardware Manager, `program.sh`) during a session. The manager wouldn't
+Don't load bitstreams yourself (Vivado Hardware Manager, `program.sh`) while you hold the access. The manager wouldn't
 know about the load, so `q55 status` would show the wrong bitstream and the next user would get
 an unexpected image. Always load through `q55 prog` or `q55 access`.
 
@@ -242,8 +231,8 @@ If you see `the U55C queue manager is not running`, ask whoever runs the enics a
 Why `q55` is a wrapper and not a direct link to `q55.py`: the manager finds `program.sh` next to `q55.py`
 (`os.path.abspath(__file__)`). Python doesn't resolve symlinks there, so if `/usr/local/bin/q55` pointed straight
 at `q55.py`, it would look for `/usr/local/bin/program.sh`. The wrapper runs `readlink -f` first, so the
-symlink works. It uses `exec`, so no extra process stays between the user's terminal and `q55.py`.
-Signals, the terminal foreground and the exit code reach `q55.py` directly.
+symlink works. It uses `exec`, so no extra process stays between the user's terminal and `q55.py`,
+and the exit code reaches the terminal directly.
 
 ## How it works
 
@@ -255,7 +244,8 @@ Signals, the terminal foreground and the exit code reach `q55.py` directly.
   works even though the manager can't read users' home directories.
 - **Loading:** `program.sh` disables the card's PCIe link, then loads the bitstream with
   Vivado Lab (`/tools/Xilinx/2026.1/Vivado_Lab`).
-- **Revoking:** an access session runs in its own process group in the terminal foreground,
-  so it can be ended as a whole.
+- **Access:** the access queue and the access holder live only in the manager. A client sends one
+  request, gets one answer and disconnects. Ending an access only changes the manager's state, and
+  user processes are never signalled. The access state isn't saved, so a manager restart drops it.
 - **Test overrides (environment variables):** `Q55_DIR`, `Q55_MGR_USER`, `Q55_PROG_CMD`
   (replaces program.sh, no sudo), `Q55_GRACE_SEC`, `Q55_STATE`, `Q55_LOG`.

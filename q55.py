@@ -4,11 +4,14 @@
 #
 #   q55 server                                          run the queue manager (enics account , forever)
 #   q55 prog   <bitstream> [-t <minutes>]               queue a bitstream load request
-#   q55 access <bitstream> [-t <minutes>] [-- <cmd>]    queue an access request , exclusive board access , loads the bitstream if needed
+#   q55 access <bitstream> [-t <minutes>]               queue an access request for exclusive board access , loads the bitstream if needed
 #   q55 status                                          queue status
 #   q55 release                                         end your turn : release your board access , end your bitstream
 #                                                       allocation window , cancel your waiting access requests
 #   q55 shutdown                                        graceful queue manager shutdown (enics account)
+#
+# Every client command returns at once. While a user holds the board access , they use the board
+# from any terminal on the machine ; q55 status shows who holds it.
 #
 # See README.md
 
@@ -20,10 +23,8 @@ import time
 import shlex
 import socket
 import struct
-import signal
 import shutil
 import argparse
-import tempfile
 import threading
 import subprocess
 from collections import deque
@@ -40,7 +41,7 @@ PROG_CMD   = os.environ.get('Q55_PROG_CMD', HERE + '/program.sh')   # called wit
 NEED_SUDO  = 'Q55_PROG_CMD' not in os.environ                 # program.sh needs the manager's sudo
 STATE_FILE = os.path.expanduser(os.environ.get('Q55_STATE','~/.q55_state.json'))
 LOG_FILE   = os.path.expanduser(os.environ.get('Q55_LOG','~/.q55.log'))
-GRACE_SEC  = float(os.environ.get('Q55_GRACE_SEC','60'))      # warning before an access session is revoked
+GRACE_SEC  = float(os.environ.get('Q55_GRACE_SEC','60'))      # time between the access end notice and its revocation
 DEF_MIN    = 10                                               # default allocation minutes
 LOAD_TIMEOUT_SEC = 900
 SUDO_KEEPALIVE_SEC = 240
@@ -79,12 +80,6 @@ def send(conn, mtype, msg='', **kw) :
     except OSError :
        pass
 
-def close_conn(conn) :
-    try :
-       conn.shutdown(socket.SHUT_RDWR)
-    except OSError :
-       pass
-
 class Refused(Exception) :
     pass
 
@@ -100,7 +95,7 @@ class Mgr :
       self.loading = None    # load entry being programmed
       self.loads   = []      # pending loads {path ver snap user t req_at}
       self.holder  = None    # access entry holding the board
-      self.waiters = []      # pending access {id user path t conn req_at granted_at warned_at}
+      self.waiters = []      # pending access {user path t req_at granted_at warned_at}
       self.events  = deque(maxlen=8)
       self.stopping = False
       self.done     = False
@@ -239,19 +234,14 @@ class Mgr :
             self.active = dict(e, loaded_at=time.monotonic())
             self.save_state()
             self.event('Loaded %s (requested by %s , allocation %g min)' % (e['path'],e['user'],e['t']))
-            for w in self.waiters :
-               if w['path'] == e['path'] :
-                  send(w['conn'],'info','%s is loaded , waiting for board access' % e['path'])
          else :
             log('Load output:\n' + out.rstrip())
-            tail = '\n'.join(out.strip().splitlines()[-5:])
             self.event('LOAD FAILED: %s (requested by %s)' % (e['path'],e['user']))
             # The board state is unknown after a failed load
             self.active = None
             self.save_state()
             for w in [w for w in self.waiters if w['path'] == e['path']] :
-               send(w['conn'],'error','load of %s failed:\n%s' % (e['path'],tail))
-               close_conn(w['conn'])
+               self.event('Access request of %s dropped , its bitstream failed to load' % w['user'])
                self.waiters.remove(w)
          self.cleanup_spool()
          self.cv.notify_all()
@@ -269,22 +259,18 @@ class Mgr :
          if not due :
             if h['warned_at'] is not None :
                h['warned_at'] = None
-               send(h['conn'],'info','nobody is waiting any more , your access continues')
+               self.event('Nobody waits any more , access of %s continues' % h['user'])
          elif h['warned_at'] is None :
             h['warned_at'] = now
             why = 'the queue manager is shutting down' if self.stopping else 'other users are waiting'
-            send(h['conn'],'warn','%s , your board access ends in %d seconds' % (why,GRACE_SEC))
-            log('Warned %s (%s)' % (h['user'],why))
+            self.event('Access of %s ends in %d seconds (%s)' % (h['user'],GRACE_SEC,why))
          elif now >= h['warned_at'] + GRACE_SEC :
-            send(h['conn'],'revoked','your board access time is over')
-            self.event('Access of %s revoked after %s' % (h['user'],dur(now - h['granted_at'])))
-            close_conn(h['conn'])
+            self.event('Access of %s ended after %s' % (h['user'],dur(now - h['granted_at'])))
             self.holder = None
 
       if self.stopping :
-         for w in self.waiters :
-            send(w['conn'],'error','the queue manager is shutting down')
-            close_conn(w['conn'])
+         if self.waiters :
+            log('Shutdown , dropped %d waiting access request(s)' % len(self.waiters))
          self.waiters = []
          if self.holder is None and self.loading is None :
             self.done = True
@@ -301,13 +287,9 @@ class Mgr :
                self.loads.append(dict(a, req_at=now))
             else :
                for w in [w for w in self.waiters if w['path'] == a['path']] :
-                  send(w['conn'],'error','%s is no longer available to reload , run q55 access again' % a['path'])
-                  close_conn(w['conn'])
+                  self.event('Access request of %s dropped , %s is no longer available to reload' % (w['user'],a['path']))
                   self.waiters.remove(w)
          self.loading = self.loads.pop(0)
-         for w in self.waiters :
-            if w['path'] == self.loading['path'] :
-               send(w['conn'],'info',self.loading_msg())
          threading.Thread(target=self.run_load,args=(self.loading,),daemon=True).start()
          return
 
@@ -317,7 +299,6 @@ class Mgr :
             w['granted_at'], w['warned_at'] = now, None
             self.holder = w
             self.event('Access granted to %s (%s , minimum %g min)' % (w['user'],w['path'],w['t']))
-            send(w['conn'],'granted','board access granted for at least %g min , %s is loaded' % (w['t'],w['path']))
             break
 
    def scheduler(self) :
@@ -329,21 +310,17 @@ class Mgr :
    #-------------------------------------------------------------------------------------
 
    def release(self, user, admin) :
-      # q55 release : the caller's turn is over. Ends the caller's access session at once (the manager
+      # q55 release : the caller's turn is over. Ends the caller's board access at once (the manager
       # user ends anyone's) , cancels the caller's waiting access requests , and ends the allocation
       # window of the bitstream the caller loaded , unless other users wait for it. Called with the lock held.
       done = []
       h = self.holder
       if h and (h['user'] == user or admin) :
-         send(h['conn'],'released','board access released by %s' % user)
          self.event('Access of %s released by %s after %s' % (h['user'],user,dur(time.monotonic() - h['granted_at'])))
-         close_conn(h['conn'])
          self.holder = None
          done.append('released the board access of %s' % h['user'])
       mine = [w for w in self.waiters if w['user'] == user]
       for w in mine :
-         send(w['conn'],'error','access request cancelled by q55 release')
-         close_conn(w['conn'])
          self.waiters.remove(w)
       a = self.active
       if a and (a['user'] == user or admin) and self.window_left() > 0 and \
@@ -420,7 +397,7 @@ class Mgr :
                   self.stopping = True
                   self.event('Shutdown requested by %s' % user)
                   self.cv.notify_all()
-               send(conn,'end','the queue manager is shutting down (after the current load and access session)')
+               send(conn,'end','the queue manager is shutting down (after the current load and board access)')
             elif cmd == 'release' :
                with self.cv :
                   msg = self.release(user,uid in (0,os.getuid()))
@@ -429,10 +406,10 @@ class Mgr :
                if len(fds) != 1 :
                   raise Refused('no bitstream file received')
                msg = self.request_load(user,req['path'],fds[0],float(req['t']))
-               if cmd == 'prog' :
-                  send(conn,'end',msg)
-               else :
-                  self.access(conn,user,req,msg)
+               if cmd == 'access' :
+                  with self.cv :
+                     msg = self.access(user,req['path'],float(req['t']),msg)
+               send(conn,'end',msg)
             else :
                raise Refused('unknown command %s' % cmd)
          except Refused as x :
@@ -445,34 +422,29 @@ class Mgr :
       finally :
          conn.close()
 
-   def access(self, conn, user, req, load_msg) :
-      with self.cv :
-         self.seq += 1
-         w = dict(id=self.seq, user=user, path=req['path'], t=float(req['t']), conn=conn,
-                  req_at=time.monotonic(), granted_at=None, warned_at=None)
-         if self.stopping :
-            raise Refused('the queue manager is shutting down')
-         self.waiters.append(w)
-         log('%s waits for access (%s , %g min)' % (user,w['path'],w['t']))
-         send(conn,'info','%s\nWaiting for board access (%d in the access queue) , Ctrl-C to cancel'
-              % (load_msg,len(self.waiters)))
-         if self.loading and self.loading['path'] == w['path'] :
-            send(conn,'info',self.loading_msg())   # the load started before this waiter was queued
-         self.cv.notify_all()
-      # The session lasts while the client keeps the connection open
-      while True :
-         try :
-            if not conn.recv(4096) : break
-         except OSError :
-            break
-      with self.cv :
-         if self.holder is w :
-            self.holder = None
-            self.event('Access released by %s after %s' % (user,dur(time.monotonic() - w['granted_at'])))
-         elif w in self.waiters :
-            self.waiters.remove(w)
-            log('%s cancelled the access request' % user)
-         self.cv.notify_all()
+   def access(self, user, path, t, load_msg) :
+      # Queues an access request in the manager , the client doesn't wait for it. Called with the lock held.
+      if self.stopping :
+         raise Refused('the queue manager is shutting down')
+      h = self.holder
+      if h and h['user'] == user and h['path'] == path :
+         return '%s\nYou already hold the board access (since %s)' % (load_msg,hhmm(h['granted_at']))
+      for i,w in enumerate(self.waiters) :
+         if w['user'] == user and w['path'] == path :
+            return '%s\nYour access request is already queued , at position %d in the access queue' % (load_msg,i+1)
+      w = dict(user=user, path=path, t=t, req_at=time.monotonic(), granted_at=None, warned_at=None)
+      self.waiters.append(w)
+      log('%s waits for access (%s , %g min)' % (user,path,t))
+      self.tick()   # grants the access now if the board is free
+      self.cv.notify_all()
+      if self.holder is w :
+         return ('%s\nGRANTED: you hold the board access now , for at least %g min. Use the board from any terminal '
+                 'on this machine , and run q55 release when you are done.' % (load_msg,t))
+      msg = ('%s\nQUEUED: your access request is at position %d in the access queue. '
+             'Run q55 status to see when you hold the board access.' % (load_msg,self.waiters.index(w)+1))
+      if self.loading and self.loading['path'] == path :
+         msg += '\n' + self.loading_msg()
+      return msg
 
 #========================================================================================
 # Server
@@ -574,78 +546,9 @@ def simple_cmd(req, bit=None) :
       sys.exit(1 if m['type'] == 'error' else 0)
    sys.exit('q55: no answer from the queue manager')
 
-def access_cmd(bit, t, cmd) :
-   s, msgs = request({'cmd':'access','t':t},bit)
-   try :
-      for m in msgs :
-         print(m['msg'],flush=True)
-         if m['type'] == 'error' : sys.exit(1)
-         if m['type'] == 'granted' : break
-      else :
-         sys.exit('q55: the queue manager closed the connection')
-   except KeyboardInterrupt :
-      sys.exit('\nq55: access request cancelled')
-
-   # Run the session in its own process group , in the terminal foreground , so that it can be revoked as a whole
-   tty = sys.stdin.isatty()
-   def child_setup() :
-      os.setpgid(0,0)
-      if tty :
-         signal.signal(signal.SIGTTOU,signal.SIG_IGN)
-         os.tcsetpgrp(0,os.getpgrp())
-         signal.signal(signal.SIGTTOU,signal.SIG_DFL)
-   env = dict(os.environ, Q55_ACCESS='1', Q55_BITSTREAM=os.path.realpath(bit))
-   rcfile = None
-   if not cmd :
-      sh = os.environ.get('SHELL','/bin/bash')
-      cmd = [sh,'-i']
-      if os.path.basename(sh) == 'bash' :
-         # Mark the access shell prompt with (q55) , after the user's own bashrc
-         with tempfile.NamedTemporaryFile('w',prefix='q55_',suffix='.bashrc',delete=False) as f :
-            f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
-                    '[ -f ~/.bashrc ] && . ~/.bashrc\n'
-                    'PS1="(q55) $PS1"\n')
-         rcfile = f.name
-         cmd = [sh,'--rcfile',rcfile,'-i']
-      print('*** q55: you now hold the U55C board. This is a new shell (prompt marked (q55)) in the same directory.\n'
-            '*** Run your work here , then type exit (or q55 release) to release the board for the next user.',flush=True)
-   p = subprocess.Popen(cmd,env=env,preexec_fn=child_setup)
-   ended = [None]   # 'revoked' or 'released' when the manager ends the session
-
-   def watch() :
-      for m in msgs :
-         print('\n*** q55: %s ***' % m['msg'],file=sys.stderr,flush=True)
-         if m['type'] in ('revoked','released') :
-            ended[0] = m['type']
-            for sig,wait in ((signal.SIGHUP,5),(signal.SIGKILL,0)) :
-               try :
-                  os.killpg(p.pid,sig)
-               except ProcessLookupError :
-                  return
-               end = time.monotonic() + wait
-               while p.poll() is None and time.monotonic() < end : time.sleep(0.1)
-            return
-
-   threading.Thread(target=watch,daemon=True).start()
-   signal.signal(signal.SIGINT,signal.SIG_IGN)
-   rc = p.wait()
-   if rcfile :
-      os.remove(rcfile)
-   if tty :
-      signal.signal(signal.SIGTTOU,signal.SIG_IGN)
-      os.tcsetpgrp(0,os.getpgrp())
-   s.close()
-   print('q55: board access %s' % (ended[0] or 'released'))
-   sys.exit({'revoked':2,'released':0}.get(ended[0],rc))
-
 #========================================================================================
 
 def main() :
-   argv = sys.argv[1:]
-   cmd = []
-   if '--' in argv :
-      i = argv.index('--')
-      argv, cmd = argv[:i], argv[i+1:]
    # The manager commands are listed in the help only for the manager user (and root)
    mgr = os.getuid() == 0 or pwd.getpwuid(os.getuid()).pw_name == MGR_USER
    ops = ['prog','access','status','release'] + (['server','shutdown'] if mgr else [])
@@ -654,8 +557,7 @@ def main() :
    def mgr_help(hlp) :
       return dict(help=hlp) if mgr else {}   # add_parser without help= is not listed
    for op,hlp in (('prog','queue a bitstream load request'),
-                  ('access','queue an access request : waits for exclusive board access , loads the bitstream '
-                            'if needed , then runs <cmd> (after --) or a shell')) :
+                  ('access','queue an access request for exclusive board access , loads the bitstream if needed')) :
       p = sub.add_parser(op,help=hlp)
       p.add_argument('bitstream')
       p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
@@ -665,24 +567,14 @@ def main() :
                                  'end the allocation window of your bitstream and cancel your waiting access requests')
    sub.add_parser('server',**mgr_help('run the queue manager (%s account)' % MGR_USER))
    sub.add_parser('shutdown',**mgr_help('graceful queue manager shutdown (%s account)' % MGR_USER))
-   args = ap.parse_args(argv)
+   args = ap.parse_args()
 
-   if cmd and args.op != 'access' :
-      ap.error('-- <cmd> is only valid with access')
    if args.op in ('prog','access') and args.t <= 0 :
       ap.error('-t must be positive')
 
    if args.op == 'server'     : server()
-   elif args.op == 'prog'     : simple_cmd({'cmd':'prog','t':args.t},args.bitstream)
-   elif args.op == 'access'   : access_cmd(args.bitstream,args.t,cmd)
-   else :
-      if args.op == 'release' :
-         # Run from inside the access session , leave its process group , which is about to be killed
-         try :
-            os.setpgid(0,0)
-         except OSError :
-            pass
-      simple_cmd({'cmd':args.op})
+   elif args.op in ('prog','access') : simple_cmd({'cmd':args.op,'t':args.t},args.bitstream)
+   else : simple_cmd({'cmd':args.op})
 
 if __name__ == '__main__' :
    main()
