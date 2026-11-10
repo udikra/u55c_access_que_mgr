@@ -595,7 +595,8 @@ def main() :
       return dict(help=hlp) if mgr else {}   # add_parser without help= is not listed
    for op,hlp in (('prog','queue a bitstream load request'),
                   ('access','queue an access request for exclusive board access , loads the bitstream if needed')) :
-      p = sub.add_parser(op,help=hlp)
+      # The options are in the q55 -h listing too , not only in q55 <op> -h
+      p = sub.add_parser(op,help='<bitstream> [-t <minutes>] [-pci] : %s' % hlp)
       p.add_argument('bitstream')
       p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
                      help='allocation time once loaded / granted (default %d min)' % DEF_MIN)
