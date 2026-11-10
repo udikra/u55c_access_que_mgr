@@ -10,8 +10,8 @@ Users run `q55` from their own accounts, which have no sudo rights.
 ## Commands
 
 ```
-q55 prog   <bitstream_path> [-t <minutes>]               queue a bitstream load
-q55 access <bitstream_path> [-t <minutes>]              queue an access request (exclusive board access)
+q55 prog   <bitstream_path> [-t <minutes>] [-pci]       queue a bitstream load
+q55 access <bitstream_path> [-t <minutes>] [-pci]       queue an access request (exclusive board access)
 q55 status                                               queue status
 q55 release                                              end your turn: access, allocation window, waiting requests
 q55 shutdown                                             graceful manager shutdown (enics only)
@@ -72,6 +72,32 @@ Means "my turn is over". Run it from any terminal, even if your `-t` time isn't 
 - Your access requests that are still waiting are cancelled.
 - `enics` can run `q55 release` to end anyone's access, for example one a user forgot to release.
 
+### -pci: bitstreams that use the PCIe interface
+
+Before every load, the manager takes the card's PCIe link down on purpose (an unexpected link drop during
+programming hangs the lab machine). By default the link stays down after the load, which is right for
+bitstreams that use only JTAG.
+
+Add `-pci` to `q55 prog` or `q55 access` if your bitstream has a PCIe core (for example XDMA) and you use it from the host.
+After the JTAG load, the manager then:
+
+1. turns off runtime power management on the slot's bridge and clears Link Disable,
+2. waits up to 10 seconds for the link (`DLActive`). If it doesn't come up, the link is disabled again and the load is reported as failed,
+3. rescans the card's PCIe bus, so the card enumerates again and the XDMA driver binds to it,
+4. gives the requesting user read/write access to the card's PCIe devices: the BAR files of every card function
+   (`/sys/bus/pci/devices/0000:4e:00.*/resourceN` and `resourceN_wc`, by owner) and `/dev/xdma*` (by ACL).
+
+The manager log shows the `PCIe:` lines of the bring-up (link status, functions found, permissions).
+
+- The XDMA driver must already be loaded (`lsmod | grep xdma`). Without it, the link comes up and the BAR files
+  are usable, but there are no `/dev/xdma*` devices. The load output in the manager log warns about this.
+- The PCIe devices follow the access holder. When another user is granted access on a `-pci` bitstream, the manager
+  gives the devices to that user. The previous user's permissions are removed. Every load recreates
+  the devices with root-only permissions.
+- A `-pci` request for a bitstream that is loaded without the PCIe link counts as a new load (it is reloaded with `-pci`).
+  A request without `-pci` is served by a `-pci` load of the same file.
+- `q55 status` shows `(PCIe link up)` next to the active bitstream, and `-pci` next to queued requests.
+
 ### Scheduling rules
 
 1. A pending load waits until the active bitstream's allocation window is over, and until
@@ -94,6 +120,7 @@ These were checked on enics-ThinkStation-P5:
 - Vivado Lab at `/tools/Xilinx/2026.1/Vivado_Lab` (the path is set in `program.sh`).
 - The card's JTAG cable (FT4232H) is connected.
 - The `enics` account has sudo rights.
+- For `-pci`: `setfacl` (package `acl`) and the XDMA driver, loaded by the lab's own setup.
 
 ### Where the files live
 
@@ -191,7 +218,8 @@ After a reboot of the lab machine, start the manager again: it isn't started aut
   are dropped. A second Ctrl-C exits at once.
 
 If the manager loses its sudo credential, loads fail with a clear message. In that case restart
-the manager. Alternatively, a sudoers `NOPASSWD` rule for `setpci` and `tee` removes the need for the password.
+the manager. Alternatively, a sudoers `NOPASSWD` rule for `setpci` and `tee` (and for `-pci`: `chown`, `chmod`, `setfacl`)
+removes the need for the password.
 
 ## Using q55 (all users)
 
@@ -225,7 +253,7 @@ If you see `the U55C queue manager is not running`, ask whoever runs the enics a
 |------|---------|
 | `q55` | The command users run. A short bash wrapper that finds its real location (following the `/usr/local/bin/q55` symlink) and runs `q55.py` from there. See below. |
 | `q55.py` | Queue manager and client (Python 3 standard library only) |
-| `program.sh` | JTAG load with PCIe link disable. Copied from u55c_py_access, with `sudo -n` |
+| `program.sh` | JTAG load with PCIe link disable. `--pcie USER` adds the link bring-up after the load; `--pcie-grant USER` and `--pcie-up USER` only hand over the devices or bring the link up (see How it works). `--pcie-only` only takes the link down. Based on u55c_py_access, with `sudo -n` |
 | `jtag_program.tcl` | Vivado Lab JTAG programming |
 
 Why `q55` is a wrapper and not a direct link to `q55.py`: the manager finds `program.sh` next to `q55.py`
@@ -243,9 +271,13 @@ and the exit code reaches the terminal directly.
   manager (SCM_RIGHTS). The manager copies it to its private spool `/tmp/q55/spool`. This
   works even though the manager can't read users' home directories.
 - **Loading:** `program.sh` disables the card's PCIe link, then loads the bitstream with
-  Vivado Lab (`/tools/Xilinx/2026.1/Vivado_Lab`).
+  Vivado Lab (`/tools/Xilinx/2026.1/Vivado_Lab`). For `-pci` requests the manager runs
+  `program.sh <bit> --pcie <user>`, which brings the link up again, and on a later access grant
+  `program.sh --pcie-grant <user>`, which only changes the device permissions.
+  For recovery, enics can run `program.sh --pcie-up <user>` by hand: it brings the link up and gives
+  the devices to the user without loading anything. Do it only when no load is running, since the manager doesn't know about it.
 - **Access:** the access queue and the access holder live only in the manager. A client sends one
   request, gets one answer and disconnects. Ending an access only changes the manager's state, and
   user processes are never signalled. The access state isn't saved, so a manager restart drops it.
 - **Test overrides (environment variables):** `Q55_DIR`, `Q55_MGR_USER`, `Q55_PROG_CMD`
-  (replaces program.sh, no sudo), `Q55_GRACE_SEC`, `Q55_STATE`, `Q55_LOG`.
+  (replaces program.sh, no sudo, called with the same arguments), `Q55_GRACE_SEC`, `Q55_STATE`, `Q55_LOG`.

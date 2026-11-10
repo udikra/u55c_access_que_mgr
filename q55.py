@@ -3,8 +3,10 @@
 # q55 : Alveo U55C board access queue manager , runs on the machine hosting the board
 #
 #   q55 server                                          run the queue manager (enics account , forever)
-#   q55 prog   <bitstream> [-t <minutes>]               queue a bitstream load request
-#   q55 access <bitstream> [-t <minutes>]               queue an access request for exclusive board access , loads the bitstream if needed
+#   q55 prog   <bitstream> [-t <minutes>] [-pci]        queue a bitstream load request
+#   q55 access <bitstream> [-t <minutes>] [-pci]        queue an access request for exclusive board access , loads the bitstream if needed
+#                                                       -pci : bring the PCIe link up after the load , and give the
+#                                                       user access to the card's PCIe devices
 #   q55 status                                          queue status
 #   q55 release                                         end your turn : release your board access , end your bitstream
 #                                                       allocation window , cancel your waiting access requests
@@ -37,7 +39,7 @@ SOCK_PATH  = Q55_DIR + '/q55.sock'
 SPOOL_DIR  = Q55_DIR + '/spool'
 MGR_USER   = os.environ.get('Q55_MGR_USER','enics')           # clients only trust a manager run by this user
 HERE       = os.path.dirname(os.path.abspath(__file__))
-PROG_CMD   = os.environ.get('Q55_PROG_CMD', HERE + '/program.sh')   # called with the bitstream path
+PROG_CMD   = os.environ.get('Q55_PROG_CMD', HERE + '/program.sh')   # called as : BIT [--pcie USER] , or : --pcie-grant USER
 NEED_SUDO  = 'Q55_PROG_CMD' not in os.environ                 # program.sh needs the manager's sudo
 STATE_FILE = os.path.expanduser(os.environ.get('Q55_STATE','~/.q55_state.json'))
 LOG_FILE   = os.path.expanduser(os.environ.get('Q55_LOG','~/.q55.log'))
@@ -91,11 +93,11 @@ class Mgr :
 
    def __init__(self) :
       self.cv      = threading.Condition()
-      self.active  = None    # loaded bitstream {path ver snap user t loaded_at}
+      self.active  = None    # loaded bitstream {path ver snap user t pcie loaded_at}
       self.loading = None    # load entry being programmed
-      self.loads   = []      # pending loads {path ver snap user t req_at}
+      self.loads   = []      # pending loads {path ver snap user t pcie req_at}
       self.holder  = None    # access entry holding the board
-      self.waiters = []      # pending access {user path t req_at granted_at warned_at}
+      self.waiters = []      # pending access {user path t pcie req_at granted_at warned_at}
       self.events  = deque(maxlen=8)
       self.stopping = False
       self.done     = False
@@ -121,11 +123,17 @@ class Mgr :
       a = self.active
       if a is None or self.window_left() <= 0 :
          return True
-      others = [w for w in self.waiters + [self.holder] if w and w['path'] == a['path'] and w['user'] != a['user']]
+      others = [w for w in self.waiters + [self.holder] if w and self.fits(w) and w['user'] != a['user']]
       return self.loads[0]['user'] == a['user'] and not others
 
-   def same_file(self, e, path, ver) :
-      return e is not None and e['path'] == path and e['ver'] == ver
+   def same_file(self, e, path, ver, pcie) :
+      # Load e gives what is asked for : the same file , with the PCIe link up if that is asked for
+      return e is not None and e['path'] == path and e['ver'] == ver and (e['pcie'] or not pcie)
+
+   def fits(self, w) :
+      # The active bitstream serves access request w : its file , with the PCIe link up if w asks for it
+      a = self.active
+      return a is not None and w['path'] == a['path'] and (a['pcie'] or not w['pcie'])
 
    def loading_msg(self) :
       return 'Loading %s now , this can take a minute or two' % self.loading['path']
@@ -147,6 +155,7 @@ class Mgr :
          return
       if a :
          a['ver'] = tuple(a['ver'])
+         a.setdefault('pcie',False)
          a['restored'] = True
          if not os.path.exists(a.get('snap') or '') : a['snap'] = None
          # A load time in the future means the clock was set back since , count from now
@@ -165,28 +174,33 @@ class Mgr :
    #-------------------------------------------------------------------------------------
    # Load requests (q55 prog , and q55 access when the bitstream is not active or queued)
 
-   def decide(self, user, path, ver, t, snap) :
+   def decide(self, user, path, ver, t, pcie, snap) :
       # Returns (message , need_snapshot). Called with the lock held.
       if self.stopping :
          raise Refused('the queue manager is shutting down')
       a = self.active
-      if self.same_file(a,path,ver) :
+      if self.same_file(a,path,ver,pcie) :
          w = self.window_left()
-         return ('ACTIVE: %s is loaded (by %s at %s , %s)' % (path,a['user'],hhmm(a['loaded_at']),
+         return ('ACTIVE: %s is loaded (by %s at %s%s , %s)' % (path,a['user'],hhmm(a['loaded_at']),
+                 ' , PCIe link up' if a['pcie'] else '',
                  'allocation window %s left' % dur(w) if w > 0 else 'allocation window over'), False)
-      if self.loading and self.loading['path'] == path and self.loading['ver'] == ver :
+      if self.same_file(self.loading,path,ver,pcie) :
          return ('LOADING: %s is being loaded now' % path, False)
       for i,e in enumerate(self.loads) :
          if e['path'] == path :
+            up = ' , the PCIe link will be brought up' if pcie and not e['pcie'] else ''
             if e['ver'] == ver :
-               return ('PENDING: %s is already in the load queue at position %d' % (path,i+1), False)
+               e['pcie'] = e['pcie'] or pcie
+               return ('PENDING: %s is already in the load queue at position %d%s' % (path,i+1,up), False)
             if snap is None : return (None, True)
-            e['ver'], e['snap'] = ver, snap
-            return ('PENDING: %s is in the load queue at position %d , updated to the newer file' % (path,i+1), False)
+            e['ver'], e['snap'], e['pcie'] = ver, snap, e['pcie'] or pcie
+            return ('PENDING: %s is in the load queue at position %d , updated to the newer file%s' % (path,i+1,up), False)
       if snap is None : return (None, True)
-      changed = ' (changed since it was loaded)' if a and a['path'] == path else ''
-      self.loads.append(dict(path=path, ver=ver, snap=snap, user=user, t=t, req_at=time.monotonic()))
-      self.event('%s queued a load of %s%s' % (user,path,changed))
+      changed = ''
+      if a and a['path'] == path :
+         changed = ' (changed since it was loaded)' if a['ver'] != ver else ' (reload with the PCIe link up)'
+      self.loads.append(dict(path=path, ver=ver, snap=snap, user=user, t=t, pcie=pcie, req_at=time.monotonic()))
+      self.event('%s queued a load of %s%s%s' % (user,path,' -pci' if pcie else '',changed))
       self.cv.notify_all()
       pos = len(self.loads)
       if self.loading is None and self.holder is None and pos == 1 and self.load_due() :
@@ -194,11 +208,11 @@ class Mgr :
       return ('BUSY: the board is allocated , your load of %s%s is queued at position %d\n\n%s'
               % (path,changed,pos,self.status_text()), False)
 
-   def request_load(self, user, path, fd, t) :
+   def request_load(self, user, path, fd, t, pcie) :
       st = os.fstat(fd)
       ver = (st.st_size, st.st_mtime_ns)
       with self.cv :
-         msg, need = self.decide(user,path,ver,t,None)
+         msg, need = self.decide(user,path,ver,t,pcie,None)
          if not need :
             return msg
          self.seq += 1
@@ -209,34 +223,40 @@ class Mgr :
          shutil.copyfileobj(src,dst,1<<20)
       os.rename(snap + '.part',snap)
       with self.cv :
-         msg, need = self.decide(user,path,ver,t,snap)
+         msg, need = self.decide(user,path,ver,t,pcie,snap)
          self.cleanup_spool()  # drops the copy if someone else queued the same file meanwhile
       return msg
 
    #-------------------------------------------------------------------------------------
 
-   def run_load(self, e) :
-      log('Loading %s (requested by %s) ...' % (e['path'],e['user']))
-      ok, out = False, ''
+   def run_prog(self, args) :
+      # Runs the load command (program.sh) , returns (ok , output)
       try :
          if NEED_SUDO and subprocess.call(['sudo','-n','true'],stdin=subprocess.DEVNULL,
                                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) != 0 :
-            out = 'the queue manager sudo credential expired , the manager must be restarted'
-         else :
-            p = subprocess.run(shlex.split(PROG_CMD) + [e['snap']],stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=LOAD_TIMEOUT_SEC)
-            out, ok = p.stdout, p.returncode == 0
+            return False, 'the queue manager sudo credential expired , the manager must be restarted'
+         p = subprocess.run(shlex.split(PROG_CMD) + args,stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=LOAD_TIMEOUT_SEC)
+         return p.returncode == 0, p.stdout
       except Exception as x :
-         out = str(x)
+         return False, str(x)
+
+   def run_load(self, e) :
+      log('Loading %s (requested by %s%s) ...' % (e['path'],e['user'],' , PCIe link up after the load' if e['pcie'] else ''))
+      ok, out = self.run_prog([e['snap']] + (['--pcie',e['user']] if e['pcie'] else []))
       with self.cv :
          self.loading = None
          if ok :
+            if e['pcie'] :
+               log('Load output (PCIe):\n' + '\n'.join(l for l in out.splitlines() if l.startswith('PCIe:')))
             self.active = dict(e, loaded_at=time.monotonic())
             self.save_state()
-            self.event('Loaded %s (requested by %s , allocation %g min)' % (e['path'],e['user'],e['t']))
+            self.event('Loaded %s (requested by %s , allocation %g min%s)' % (e['path'],e['user'],e['t'],
+                       ' , PCIe link up , PCIe devices given to %s' % e['user'] if e['pcie'] else ''))
          else :
             log('Load output:\n' + out.rstrip())
-            self.event('LOAD FAILED: %s (requested by %s)' % (e['path'],e['user']))
+            self.event('LOAD FAILED: %s (requested by %s%s)' % (e['path'],e['user'],
+                       ' , -pci : the bitstream or the PCIe link bring-up failed' if e['pcie'] else ''))
             # The board state is unknown after a failed load
             self.active = None
             self.save_state()
@@ -246,6 +266,16 @@ class Mgr :
          self.cleanup_spool()
          self.cv.notify_all()
 
+   def pcie_grant(self, user) :
+      # Gives the access holder the card's PCIe devices (they belong to whoever loaded the bitstream)
+      ok, out = self.run_prog(['--pcie-grant',user])
+      with self.cv :
+         if ok :
+            self.event('PCIe devices given to %s' % user)
+         else :
+            log('PCIe grant output:\n' + out.rstrip())
+            self.event('PCIe device permissions for %s FAILED' % user)
+
    #-------------------------------------------------------------------------------------
    # Scheduler , called every second and on every queue change , with the lock held
 
@@ -254,7 +284,7 @@ class Mgr :
       h = self.holder
       if h :
          a = self.active
-         contention = self.load_due() or any(a and w['path'] == a['path'] for w in self.waiters)
+         contention = self.load_due() or any(self.fits(w) for w in self.waiters)
          due = self.stopping or (contention and now >= h['granted_at'] + h['t']*60)
          if not due :
             if h['warned_at'] is not None :
@@ -282,11 +312,11 @@ class Mgr :
       if self.load_due() :
          # Users waiting for the outgoing bitstream are queued behind the pending loads
          a = self.active
-         if a and any(w['path'] == a['path'] for w in self.waiters) and not any(e['path'] == a['path'] for e in self.loads) :
+         if a and any(self.fits(w) for w in self.waiters) and not any(e['path'] == a['path'] for e in self.loads) :
             if a['snap'] :
                self.loads.append(dict(a, req_at=now))
             else :
-               for w in [w for w in self.waiters if w['path'] == a['path']] :
+               for w in [w for w in self.waiters if self.fits(w)] :
                   self.event('Access request of %s dropped , %s is no longer available to reload' % (w['user'],a['path']))
                   self.waiters.remove(w)
          self.loading = self.loads.pop(0)
@@ -294,11 +324,13 @@ class Mgr :
          return
 
       for w in self.waiters :
-         if self.active and w['path'] == self.active['path'] :
+         if self.fits(w) :
             self.waiters.remove(w)
             w['granted_at'], w['warned_at'] = now, None
             self.holder = w
             self.event('Access granted to %s (%s , minimum %g min)' % (w['user'],w['path'],w['t']))
+            if self.active['pcie'] and w['user'] != self.active['user'] :
+               threading.Thread(target=self.pcie_grant,args=(w['user'],),daemon=True).start()
             break
 
    def scheduler(self) :
@@ -324,7 +356,7 @@ class Mgr :
          self.waiters.remove(w)
       a = self.active
       if a and (a['user'] == user or admin) and self.window_left() > 0 and \
-         not any(w['path'] == a['path'] and w['user'] != a['user'] for w in self.waiters) :
+         not any(self.fits(w) and w['user'] != a['user'] for w in self.waiters) :
          a['t'] = (time.monotonic() - a['loaded_at'])/60   # shorten the window to now , keep the load time
          self.save_state()
          self.event('Allocation window of %s ended by %s' % (a['path'],user))
@@ -346,14 +378,15 @@ class Mgr :
       a = self.active
       if a :
          w = self.window_left()
-         L.append('Active bitstream : %s' % a['path'])
+         L.append('Active bitstream : %s%s' % (a['path'],' (PCIe link up)' if a['pcie'] else ''))
          L.append('                   loaded by %s at %s , %s%s' % (a['user'],hhmm(a['loaded_at']),
                   'allocation window %s left' % dur(w) if w > 0 else 'allocation window over , stays loaded until another load is requested',
                   ' (restored from the previous manager run)' if a.get('restored') else ''))
       else :
          L.append('Active bitstream : none (or unknown)')
       if self.loading :
-         L.append('Loading now      : %s (requested by %s)' % (self.loading['path'],self.loading['user']))
+         L.append('Loading now      : %s (requested by %s%s)' % (self.loading['path'],self.loading['user'],
+                  ' , -pci' if self.loading['pcie'] else ''))
       h = self.holder
       if h :
          s = 'Access holder    : %s , since %s , minimum %g min' % (h['user'],hhmm(h['granted_at']),h['t'])
@@ -364,10 +397,12 @@ class Mgr :
          L.append('Access holder    : none')
       L.append('Access queue     : %s' % ('empty' if not self.waiters else ''))
       for i,w in enumerate(self.waiters) :
-         L.append('   %d. %-10s %g min  waiting %s  %s' % (i+1,w['user'],w['t'],dur(now - w['req_at']),w['path']))
+         L.append('   %d. %-10s %g min  waiting %s  %s%s' % (i+1,w['user'],w['t'],dur(now - w['req_at']),w['path'],
+                  '  -pci' if w['pcie'] else ''))
       L.append('Load queue       : %s' % ('empty' if not self.loads else ''))
       for i,e in enumerate(self.loads) :
-         L.append('   %d. %-10s %g min  waiting %s  %s' % (i+1,e['user'],e['t'],dur(now - e['req_at']),e['path']))
+         L.append('   %d. %-10s %g min  waiting %s  %s%s' % (i+1,e['user'],e['t'],dur(now - e['req_at']),e['path'],
+                  '  -pci' if e['pcie'] else ''))
       if self.events :
          L.append('Recent events    :')
          L += ['   ' + e for e in self.events]
@@ -405,10 +440,11 @@ class Mgr :
             elif cmd in ('prog','access') :
                if len(fds) != 1 :
                   raise Refused('no bitstream file received')
-               msg = self.request_load(user,req['path'],fds[0],float(req['t']))
+               pcie = bool(req.get('pcie'))
+               msg = self.request_load(user,req['path'],fds[0],float(req['t']),pcie)
                if cmd == 'access' :
                   with self.cv :
-                     msg = self.access(user,req['path'],float(req['t']),msg)
+                     msg = self.access(user,req['path'],float(req['t']),pcie,msg)
                send(conn,'end',msg)
             else :
                raise Refused('unknown command %s' % cmd)
@@ -422,17 +458,18 @@ class Mgr :
       finally :
          conn.close()
 
-   def access(self, user, path, t, load_msg) :
+   def access(self, user, path, t, pcie, load_msg) :
       # Queues an access request in the manager , the client doesn't wait for it. Called with the lock held.
       if self.stopping :
          raise Refused('the queue manager is shutting down')
       h = self.holder
-      if h and h['user'] == user and h['path'] == path :
+      if h and h['user'] == user and h['path'] == path and self.fits(dict(h, pcie=pcie)) :
          return '%s\nYou already hold the board access (since %s)' % (load_msg,hhmm(h['granted_at']))
       for i,w in enumerate(self.waiters) :
          if w['user'] == user and w['path'] == path :
+            w['pcie'] = w['pcie'] or pcie
             return '%s\nYour access request is already queued , at position %d in the access queue' % (load_msg,i+1)
-      w = dict(user=user, path=path, t=t, req_at=time.monotonic(), granted_at=None, warned_at=None)
+      w = dict(user=user, path=path, t=t, pcie=pcie, req_at=time.monotonic(), granted_at=None, warned_at=None)
       self.waiters.append(w)
       log('%s waits for access (%s , %g min)' % (user,path,t))
       self.tick()   # grants the access now if the board is free
@@ -562,6 +599,9 @@ def main() :
       p.add_argument('bitstream')
       p.add_argument('-t',metavar='<minutes>',type=float,default=DEF_MIN,
                      help='allocation time once loaded / granted (default %d min)' % DEF_MIN)
+      p.add_argument('-pci',action='store_true',
+                     help='for bitstreams with a PCIe core : bring the PCIe link up after the load and give you '
+                          'access to the card\'s PCIe devices (BAR files and /dev/xdma*)')
    sub.add_parser('status',help='queue status')
    sub.add_parser('release',help='end your turn now (even before -t is over) : release your board access , '
                                  'end the allocation window of your bitstream and cancel your waiting access requests')
@@ -573,7 +613,7 @@ def main() :
       ap.error('-t must be positive')
 
    if args.op == 'server'     : server()
-   elif args.op in ('prog','access') : simple_cmd({'cmd':args.op,'t':args.t},args.bitstream)
+   elif args.op in ('prog','access') : simple_cmd({'cmd':args.op,'t':args.t,'pcie':args.pci},args.bitstream)
    else : simple_cmd({'cmd':args.op})
 
 if __name__ == '__main__' :

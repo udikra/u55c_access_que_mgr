@@ -22,12 +22,31 @@ q55 release                                        # done: release the board for
 | Command | What it does |
 |---------|--------------|
 | `q55 status` | Shows the loaded bitstream, the current board holder, the queues and recent events. |
-| `q55 access <bit> [-t <min>]` | Queues an access request and returns. When your turn comes, you hold the board. Loads `<bit>` first if needed. |
-| `q55 prog <bit> [-t <min>]` | Only queues a load of `<bit>`. It doesn't give you the board. |
+| `q55 access <bit> [-t <min>] [-pci]` | Queues an access request and returns. When your turn comes, you hold the board. Loads `<bit>` first if needed. |
+| `q55 prog <bit> [-t <min>] [-pci]` | Only queues a load of `<bit>`. It doesn't give you the board. |
 | `q55 release` | Ends your turn now, even before your `-t` is over: releases your board access, ends the allocation window of your bitstream, and cancels your waiting access requests. |
 | `q55 -h` | Help. |
 
-`-t` defaults to 10 minutes.
+`-t` defaults to 10 minutes. Add `-pci` to `access` or `prog` if your bitstream uses the PCIe interface (see below).
+
+## Bitstreams with PCIe (`-pci`)
+
+The PCIe link is taken down before every load, and by default it stays down. If your design has a PCIe
+core (for example XDMA) and you use it from the host, ask for it with `-pci`:
+
+```
+q55 access <path_to_your_bitstream_file> -t 20 -pci
+```
+
+After the load, the manager brings the PCIe link up, rescans the card, and gives you read/write access to its
+PCIe devices: the BAR files (`/sys/bus/pci/devices/0000:4e:00.*/resourceN` and `resourceN_wc`) and `/dev/xdma*`.
+You don't need sudo.
+
+- `q55 status` shows `(PCIe link up)` next to the active bitstream.
+- If the link doesn't come up (for example, the bitstream has no PCIe core), the load shows as `LOAD FAILED`.
+- If someone else holds the board on the same bitstream after you, the PCIe devices are moved to them.
+- If the bitstream is already loaded without `-pci`, a `-pci` request reloads it.
+- The next load of any bitstream takes the PCIe link down again, so the PCIe devices disappear.
 
 ## Working with the board (`q55 access`)
 
@@ -88,4 +107,5 @@ Messages you may see when you ask for a bitstream:
 | `the U55C queue manager is not running` | Ask whoever runs the enics account to start `q55 server`. |
 | `bitstream ... not found` | Check the path. It must be a file you can read. |
 | `LOAD FAILED` in `q55 status` | The board state is unknown, and access requests for that bitstream are dropped. Report it if a load that worked before now fails. |
+| No `/dev/xdma*` or `Permission denied` on the card's PCIe devices | Check that you used `-pci` and that you are the `Access holder`. If the devices are still missing, report it: the XDMA driver may not be loaded. |
 | `q55: command not found` | Use `/opt/q55/q55`, or add `/usr/local/bin` to your `PATH`. |
