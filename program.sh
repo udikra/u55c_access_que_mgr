@@ -70,9 +70,14 @@ card_devs() {
 # chown) and the XDMA character devices (ACL, the previous user's entry is
 # removed). Both are recreated with root-only access on every load.
 grant() {
-    local user=$1 devs dev f n=0
+    local user=$1 devs dev f nodes="" found n=0
     devs=$(card_devs)
     [ -n "$devs" ] || { echo "PCIe: no U55C function on bus $card_bus, is the link up?" >&2; return 1; }
+    # Validate driver readiness before claiming that permissions were granted.
+    for dev in $devs; do
+        found=$($SUDO python3 "$here/ensure_xdma.py" "$dev") || return 1
+        nodes="$nodes $found"
+    done
     for dev in $devs; do
         for f in "$dev"/resource[0-9] "$dev"/resource[0-9]_wc; do      # BARs , not resourceN_resize
             [ -e "$f" ] || continue
@@ -82,7 +87,7 @@ grant() {
         done
     done
     udevadm settle --timeout=10 > /dev/null 2>&1 || true   # the XDMA driver creates /dev/xdma* via udev
-    for f in /dev/xdma*; do
+    for f in $nodes; do
         [ -c "$f" ] || continue
         $SUDO setfacl -b "$f"
         $SUDO setfacl -m "u:$user:rw" "$f"
@@ -105,7 +110,7 @@ pcie_up() {
     local i sta up=0
     echo on | $SUDO tee "/sys/bus/pci/devices/$bridge/power/control" > /dev/null   # no runtime suspend
     $SUDO setpci -s "$bridge" CAP_EXP+0x10.w=0000:0010             # LNKCTL: Link Disable off
-    for i in $(seq 1 10); do
+    for i in $(seq 1 30); do
         sleep 1
         sta=$($SUDO setpci -s "$bridge" CAP_EXP+0x12.w)
         if (( 0x$sta & 0x2000 )); then up=1; break; fi             # LNKSTA: DLActive
@@ -138,7 +143,7 @@ if [ "$mode" = up ]; then
     exit 0
 fi
 
-for dev in /sys/bus/pci/devices/*; do
+for dev in $(card_devs); do
     if [ "$(cat "$dev/vendor")" = "0x10ee" ]; then
         echo "PCIe: removing $(basename "$dev") ($(cat "$dev/device"))"
         echo 1 | $SUDO tee "$dev/remove" > /dev/null

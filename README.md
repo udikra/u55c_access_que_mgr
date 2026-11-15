@@ -152,7 +152,7 @@ First copy the files, under your own lab account, to your workspace `/home/enics
 # on Windows (Git Bash), in the repository folder. LAB_USER is your account on the lab machine:
 LAB_USER=<your lab account>
 ssh $LAB_USER@<lab-machine> mkdir -p /home/enics/users_workspace/$LAB_USER/q55_files
-scp q55 q55.py program.sh jtag_program.tcl README.md $LAB_USER@<lab-machine>:/home/enics/users_workspace/$LAB_USER/q55_files/
+scp q55 q55.py program.sh ensure_xdma.py jtag_program.tcl README.md $LAB_USER@<lab-machine>:/home/enics/users_workspace/$LAB_USER/q55_files/
 
 # on the lab machine, logged in as your own account:
 su - enics -c "mkdir -p ~/u55c_server && cp /home/enics/users_workspace/$USER/q55_files/* ~/u55c_server/"
@@ -167,8 +167,8 @@ After `su - enics`, `$USER` is `enics`.
 cd ~/u55c_server
 sudo install -d -m 755 /opt/q55
 sudo install -m 755 q55 q55.py program.sh /opt/q55/
-sudo install -m 644 jtag_program.tcl /opt/q55/
-sudo sed -i 's/\r$//' /opt/q55/*                  # strip Windows line endings, if any
+sudo install -m 644 jtag_program.tcl ensure_xdma.py /opt/q55/
+sudo sed -i 's/\r$//' /opt/q55/q55 /opt/q55/q55.py /opt/q55/program.sh /opt/q55/ensure_xdma.py /opt/q55/jtag_program.tcl                  # strip Windows line endings, if any
 sudo ln -sf /opt/q55/q55 /usr/local/bin/q55
 ```
 
@@ -281,3 +281,9 @@ and the exit code reaches the terminal directly.
   user processes are never signalled. The access state isn't saved, so a manager restart drops it.
 - **Test overrides (environment variables):** `Q55_DIR`, `Q55_MGR_USER`, `Q55_PROG_CMD`
   (replaces program.sh, no sudo, called with the same arguments), `Q55_GRACE_SEC`, `Q55_STATE`, `Q55_LOG`.
+
+### XDMA readiness for 10ee:9048
+
+PCIe recovery now verifies the driver and character devices before reporting
+success for the tested XDMA endpoint. Install the matching kernel module as
+described in [XDMA recovery](docs/XDMA_RECOVERY.md).
