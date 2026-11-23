@@ -56,9 +56,19 @@ def complete(nodes):
                name.removesuffix('_h2c_0') + '_control' in names for name in names)
 
 
-def check_bars(dev):
+# Supported XDMA layouts: PCI device ID -> minimum (BAR index, bytes) sizes.
+#   0x9048: the originally tested endpoint (BAR0 4 MiB , BAR1 64 KiB)
+#   0x903f: the k5 U55C image (k5_xbox comp_fpga_u55c.py -pci: BAR0 2 MiB AXI-Lite to the k5 system space ,
+#           BAR1 64 KiB XDMA DMA registers ; the DMA channels reach the 64 KB BRAM or , with -hbm , the HBM)
+SUPPORTED = {
+    '0x9048': ((0, 4 * 1024 * 1024), (1, 64 * 1024)),
+    '0x903f': ((0, 2 * 1024 * 1024), (1, 64 * 1024)),
+}
+
+
+def check_bars(dev, minima=SUPPORTED['0x9048']):
     lines = (dev / 'resource').read_text().splitlines()
-    for index, minimum in ((0, 4 * 1024 * 1024), (1, 64 * 1024)):
+    for index, minimum in minima:
         start, end, flags = (int(v, 16) for v in lines[index].split())
         if not start or end - start + 1 < minimum or not flags & 0x200:
             raise RuntimeError(f'{dev.name}: BAR{index} is unassigned or smaller than {minimum}; check bridge allocation')
@@ -69,11 +79,12 @@ def ensure(dev):
         raise RuntimeError('Expected an exact PCI sysfs function path')
     if (dev / 'vendor').read_text().strip() != '0x10ee':
         raise RuntimeError('Not a Xilinx endpoint')
-    # Only the observed and supported 10ee:9048 layout requires this driver.
+    # Only the supported layouts (SUPPORTED) require this driver.
     # Other bitstreams keep BAR-only operation; existing matching nodes can be granted.
-    if (dev / 'device').read_text().strip() != '0x9048':
+    minima = SUPPORTED.get((dev / 'device').read_text().strip())
+    if minima is None:
         return card_nodes(dev)
-    check_bars(dev)
+    check_bars(dev, minima)
     driver = dev / 'driver'
     if driver.exists() and driver.resolve().name != 'xdma':
         raise RuntimeError(f'{dev.name} is bound to {driver.resolve().name}; refusing to unbind it automatically')

@@ -282,8 +282,9 @@ and the exit code reaches the terminal directly.
 - **Test overrides (environment variables):** `Q55_DIR`, `Q55_MGR_USER`, `Q55_PROG_CMD`
   (replaces program.sh, no sudo, called with the same arguments), `Q55_GRACE_SEC`, `Q55_STATE`, `Q55_LOG`.
 
-### XDMA readiness for 10ee:9048
+### XDMA readiness for 10ee:9048 and 10ee:903f
 
 PCIe recovery now verifies the driver and character devices before reporting
-success for the tested XDMA endpoint. Install the matching kernel module as
-described in [XDMA recovery](docs/XDMA_RECOVERY.md).
+success for the supported XDMA endpoints (10ee:9048 , and the k5 U55C image
+10ee:903f). Install the matching kernel module as described in
+[XDMA recovery](docs/XDMA_RECOVERY.md).

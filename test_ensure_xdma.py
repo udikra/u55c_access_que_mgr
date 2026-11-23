@@ -54,6 +54,35 @@ SUDO=reject
             with self.assertRaisesRegex(RuntimeError, 'BAR0'):
                 m.check_bars(dev)
 
+    def test_903f_layout_bars(self):
+        # k5 U55C image: BAR0 2 MiB , BAR1 64 KiB (the 0x9048 4 MiB BAR0 rule stays for 0x9048)
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            (dev / 'resource').write_text('a8000000 a81fffff 40200\na8200000 a820ffff 40200\n')
+            m.check_bars(dev, m.SUPPORTED['0x903f'])
+            with self.assertRaisesRegex(RuntimeError, 'BAR0'):
+                m.check_bars(dev, m.SUPPORTED['0x9048'])
+
+    def test_903f_small_bar0_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            (dev / 'resource').write_text('a8000000 a80fffff 40200\na8200000 a820ffff 40200\n')
+            with self.assertRaisesRegex(RuntimeError, 'BAR0'):
+                m.check_bars(dev, m.SUPPORTED['0x903f'])
+
+    def test_unsupported_id_is_bar_only(self):
+        # an unknown device ID loads nothing: only already existing nodes of that card are returned
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dev = base / '0000:4e:00.0'; dev.mkdir()
+            (dev / 'vendor').write_text('0x10ee\n'); (dev / 'device').write_text('0x7038\n')
+            with patch.object(m, 'card_nodes', return_value=['NODES']) as cn, \
+                 patch.object(Path, 'parent', new_callable=lambda: property(lambda s: Path('/sys/bus/pci/devices'))), \
+                 patch.object(m, 'run') as run:
+                self.assertEqual(m.ensure(dev), ['NODES'])
+                run.assert_not_called()
+                cn.assert_called_once()
+
     def test_untrusted_module_rejected(self):
         with tempfile.NamedTemporaryFile() as tmp:
             with self.assertRaisesRegex(RuntimeError, 'Untrusted driver path'):

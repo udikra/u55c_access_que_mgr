@@ -1,8 +1,15 @@
 # XDMA recovery
 
-For the tested Xilinx 10ee:9048 endpoint, PCIe link-up alone is insufficient.
-`program.sh` calls `ensure_xdma.py` before granting access. It verifies BAR0
-(4 MiB), BAR1 (64 KiB), the PCIe XDMA driver, and matching user/control/H2C nodes.
+For the supported Xilinx XDMA endpoints, PCIe link-up alone is insufficient.
+`program.sh` calls `ensure_xdma.py` before granting access. It verifies the BAR
+sizes of the endpoint's layout, the PCIe XDMA driver, and matching user/control/H2C
+nodes. Layouts (`SUPPORTED` in `ensure_xdma.py`):
+
+| Device | BAR0 | BAR1 | Image |
+|---|---|---|---|
+| 10ee:9048 | 4 MiB | 64 KiB | the originally tested endpoint |
+| 10ee:903f | 2 MiB | 64 KiB | k5 U55C image (`comp_fpga_u55c.py -pci`, k5_xbox): BAR0 AXI-Lite to the k5 system space , DMA to the 64 KB BRAM or (`-hbm`) the 16 GB HBM |
+
 A missing driver is loaded from `/opt/q55/xdma/$(uname -r)/xdma.ko`.
 The module and all parent directories must be root-owned and not writable by
 other users. Kernel version and PCI aliases are checked before loading.
